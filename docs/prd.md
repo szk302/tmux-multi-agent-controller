@@ -369,7 +369,7 @@ tmac [-p <PROJECT>] spawn [OPTIONS] [<PROJECT>/]<NAME> -- <COMMAND> [ARGS]...
 
 * `spawn` は、読める範囲の設定（`~/.claude/settings.json`、作業ディレクトリの `.claude/settings.json`・`.claude/settings.local.json`、管理者の設定ファイル）と、有効なプラグインのフック定義を調べる。`Stop`・`UserPromptSubmit` に tmac 以外のフックがあれば、見つけた場所を標準エラー出力に示し、起動せずに終了コード 2 とする。
     * そのフックが停止や入力を止めるかどうかは、実行してみるまで分からないためである。
-* 通知やログだけを行い、停止や入力を止めないと分かっているフックの場合は、`--allow-foreign-hooks` で起動できる。止める可能性のある処理は、CLI の設定から外して中継（§6.3）に移す。
+* 通知やログだけを行い、停止や入力を止めないと分かっているフックの場合は、`--allow-foreign-hooks` で起動できる。いつも同じ場所にあるもの（利用者が入れたプラグインなど）は、設定の `spawn.allow_foreign_hooks`（§12.2）に書いておけば、`--allow-foreign-hooks` なしで起動できる。止める可能性のある処理は、CLI の設定から外して中継（§6.3）に移す。
 * 設定の読み込み元（`--setting-sources`）は制限しない。権限や rules などの必要な設定まで読まれなくなるためである。
 * 見落としたフックが停止を止めた場合に備え、入力の前に、`idle` が `send.settle_sec` 続くことを確かめる（§1.4「入力できる」）。止められた後の処理でツールを使えば、`PreToolUse` で `busy` に戻るため、多くの場合はこの間に気付ける。
 * 呼び出し側の `--settings`（§5.5）にある `Stop`・`UserPromptSubmit` のフックも、tmac 以外のフックとして扱う。
@@ -651,6 +651,7 @@ tmac kill [--timeout <SEC>] [--force] <NAME>
 | `tmux.session` | string | なし（プロジェクト名） | `spawn` が新しいウィンドウを作るセッション。省略すると、プロジェクトごとのセッション（プロジェクト名の `.`・`:` を `-` に置き換えた名前）にする。 |
 | `tmux.socket_name` | string | なし（tmux の既定） | tmux の `-L` に渡すソケット名。`spawn` で使ったソケットを `agent.yml` に記録し、以後のコマンドはそのソケットを使う。 |
 | `spawn.timeout` | 数値（秒） | `60` | 起動の完了を待つ時間の上限。 |
+| `spawn.allow_foreign_hooks` | 真偽値、または文字列のリスト | `false` | tmac 以外のフックがあっても起動を断らない範囲（§5.6）。`true` はすべて、リストは、`spawn` が示す場所（例: `plugin codex@openai-codex (...)`）がいずれかの文字列で始まるものを許す。 |
 | `send.settle_sec` | 数値（秒） | `10` | 入力できるとみなすまでに、`idle` が続く必要がある時間（§1.4）。リアルタイム性は求めないため、長めにしてよい。 |
 | `send.confirm_timeout` | 数値（秒） | `15` | 入力の確認を待つ時間の上限。 |
 | `send.max_bytes` | 整数 | `65536` | 入力するテキストの長さの上限。 |

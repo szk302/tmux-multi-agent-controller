@@ -16,6 +16,8 @@ pub struct Config {
     pub tmux_session: Option<String>,
     pub tmux_socket_name: Option<String>,
     pub spawn_timeout: f64,
+    /// Other hooks that spawn accepts (§5.6).
+    pub allow_foreign_hooks: ForeignHooks,
     pub send_settle_sec: f64,
     pub send_confirm_timeout: f64,
     pub send_max_bytes: usize,
@@ -34,6 +36,7 @@ impl Default for Config {
             tmux_session: None,
             tmux_socket_name: None,
             spawn_timeout: 60.0,
+            allow_foreign_hooks: ForeignHooks::None,
             send_settle_sec: 10.0,
             send_confirm_timeout: 15.0,
             send_max_bytes: 65536,
@@ -42,6 +45,26 @@ impl Default for Config {
             relay_timeout: 20.0,
             relay: BTreeMap::new(),
             submit_delay_ms: BTreeMap::new(),
+        }
+    }
+}
+
+/// Hooks other than tmac's that `spawn` accepts without
+/// `--allow-foreign-hooks` (§5.6, §12.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForeignHooks {
+    None,
+    All,
+    /// Places (as spawn reports them) starting with one of these.
+    Prefixes(Vec<String>),
+}
+
+impl ForeignHooks {
+    pub fn allows(&self, place: &str) -> bool {
+        match self {
+            ForeignHooks::None => false,
+            ForeignHooks::All => true,
+            ForeignHooks::Prefixes(p) => p.iter().any(|p| place.starts_with(p.as_str())),
         }
     }
 }
@@ -129,6 +152,24 @@ pub fn parse(text: &str) -> std::result::Result<Config, String> {
                 for (k2, v2) in mapping(v, "spawn")? {
                     match k2.as_str().unwrap_or_default() {
                         "timeout" => cfg.spawn_timeout = number(v2, "spawn.timeout")?,
+                        "allow_foreign_hooks" => {
+                            cfg.allow_foreign_hooks = match v2 {
+                                Value::Bool(true) => ForeignHooks::All,
+                                Value::Bool(false) => ForeignHooks::None,
+                                Value::Sequence(items) => ForeignHooks::Prefixes(
+                                    items
+                                        .iter()
+                                        .map(|i| string(i, "spawn.allow_foreign_hooks[]"))
+                                        .collect::<std::result::Result<_, _>>()?,
+                                ),
+                                _ => {
+                                    return Err(
+                                        "spawn.allow_foreign_hooks must be true, false or a list of strings"
+                                            .into(),
+                                    );
+                                }
+                            }
+                        }
                         other => warn(format!("unknown config key: spawn.{other}")),
                     }
                 }
@@ -232,6 +273,23 @@ mod tests {
         assert_eq!(c.hold_human_sec, 600.0);
         assert_eq!(c.submit_delay("codex", 1), 700);
         assert_eq!(c.submit_delay("claude", 200), 200);
+    }
+
+    #[test]
+    fn foreign_hooks_setting() {
+        assert_eq!(parse("").unwrap().allow_foreign_hooks, ForeignHooks::None);
+        let c = parse("spawn:\n  allow_foreign_hooks: true\n").unwrap();
+        assert!(c.allow_foreign_hooks.allows("anything"));
+        let c = parse("spawn:\n  allow_foreign_hooks:\n    - plugin codex@openai-codex\n").unwrap();
+        assert!(
+            c.allow_foreign_hooks
+                .allows("plugin codex@openai-codex (/x/hooks.json): hooks.Stop")
+        );
+        assert!(
+            !c.allow_foreign_hooks
+                .allows("/repo/.claude/settings.json: hooks.Stop")
+        );
+        assert!(parse("spawn:\n  allow_foreign_hooks: 3\n").is_err());
     }
 
     #[test]

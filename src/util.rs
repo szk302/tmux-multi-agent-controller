@@ -254,17 +254,33 @@ pub fn process_start_time(pid: u32) -> Option<String> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // The command name (field 2) is in parentheses and may contain spaces.
     let rest = &stat[stat.rfind(')')? + 1..];
-    rest.split_whitespace().nth(19).map(str::to_string)
+    let mut fields = rest.split_whitespace();
+    // A zombie has ended; it only waits to be reaped (no init in some containers).
+    if fields.next()? == "Z" {
+        return None;
+    }
+    fields.nth(18).map(str::to_string)
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn process_start_time(pid: u32) -> Option<String> {
     let out = std::process::Command::new("ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .args(["-o", "stat=", "-o", "lstart=", "-p", &pid.to_string()])
         .output()
         .ok()?;
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (out.status.success() && !s.is_empty()).then_some(s)
+    if !out.status.success() {
+        return None;
+    }
+    parse_ps_start(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Start time from `ps -o stat= -o lstart=`; `None` for a zombie, which has
+/// ended and only waits to be reaped.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn parse_ps_start(out: &str) -> Option<String> {
+    let (stat, start) = out.trim().split_once(char::is_whitespace)?;
+    let start = start.trim();
+    (!stat.starts_with('Z') && !start.is_empty()).then(|| start.to_string())
 }
 
 /// Whether `pid` is still the process that started at `start`.
@@ -320,6 +336,31 @@ mod tests {
         assert_eq!(sh_quote("/usr/bin/tmac"), "/usr/bin/tmac");
         assert_eq!(sh_quote("a b"), "'a b'");
         assert_eq!(sh_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn ps_output() {
+        assert_eq!(
+            parse_ps_start("Ss   Sat Nov 21 04:29:43 2026\n").as_deref(),
+            Some("Sat Nov 21 04:29:43 2026")
+        );
+        assert_eq!(parse_ps_start("Z    Sat Nov 21 04:29:43 2026\n"), None);
+        assert_eq!(parse_ps_start(""), None);
+    }
+
+    #[test]
+    fn zombies_count_as_ended() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        // Not reaped yet: a zombie.
+        for _ in 0..100 {
+            if process_start_time(pid).is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(process_start_time(pid).is_none());
+        child.wait().unwrap();
     }
 
     #[test]

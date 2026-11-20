@@ -318,6 +318,16 @@ fn foreign_hooks_are_refused() {
     assert!(!env.agent_dir("f1").exists());
     env.spawn("f1", "claude", &["--allow-foreign-hooks"], &[]);
     env.ok(&["kill", "f1"]);
+    // The configuration can accept known places that never block.
+    let accepting = Env::with_config("spawn:\n  allow_foreign_hooks:\n    - /\n");
+    std::fs::create_dir_all(accepting.work.join(".claude")).unwrap();
+    std::fs::copy(
+        env.work.join(".claude/settings.json"),
+        accepting.work.join(".claude/settings.json"),
+    )
+    .unwrap();
+    accepting.spawn("f2", "claude", &[], &[]);
+    accepting.ok(&["kill", "f2"]);
 }
 
 #[test]
