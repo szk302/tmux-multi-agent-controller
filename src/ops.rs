@@ -34,11 +34,11 @@ pub fn reconcile(agent: &Agent) -> Result<(StateFile, Option<PaneInfo>)> {
             None
         }
     };
-    let _g = agent.home.state_lock(agent.name())?;
+    let _g = agent.home.state_lock(&agent.key())?;
     if !agent.still_current()? {
         return Err(Error::NoAgent(format!(
             "agent {} was replaced",
-            agent.name()
+            agent.label()
         )));
     }
     let mut st = agent.state()?;
@@ -123,14 +123,15 @@ pub fn attempt_input(
     lock_wait: Option<Duration>,
     sig: &AtomicUsize,
 ) -> Result<Attempt> {
-    let name = agent.name();
+    let key = agent.key();
+    let name = key.to_string();
     let instance = agent.instance();
     let _input_lock = agent
         .home
-        .lock(name, LockKind::Input, lock_wait, Some(sig))?;
+        .lock(&key, LockKind::Input, lock_wait, Some(sig))?;
     let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
     {
-        let _g = agent.home.state_lock(name)?;
+        let _g = agent.home.state_lock(&key)?;
         if !agent.still_current()? {
             return Err(Error::NoAgent(format!("agent {name} was replaced")));
         }
@@ -156,7 +157,7 @@ pub fn attempt_input(
         })?;
     }
     let abandon = |agent: &Agent| {
-        if let Ok(_g) = agent.home.state_lock(name) {
+        if let Ok(_g) = agent.home.state_lock(&key) {
             let _ = agent.remove_input();
         }
     };
@@ -196,7 +197,7 @@ pub fn attempt_input(
     thread::sleep(Duration::from_millis(delay));
     let entered = tmux.send_key_tagged(&pane.id, instance, "Enter");
     if !matches!(entered, Ok(true)) {
-        let _g = agent.home.state_lock(name)?;
+        let _g = agent.home.state_lock(&key)?;
         settle_input(agent)?;
         refresh_display_now(agent);
         return Err(Error::Unconfirmed(format!(
@@ -206,17 +207,17 @@ pub fn attempt_input(
     let deadline = Instant::now() + Duration::from_secs_f64(cfg.send_confirm_timeout);
     loop {
         let progress = {
-            let _g = agent.home.state_lock(name)?;
+            let _g = agent.home.state_lock(&key)?;
             agent.input()?.filter(|i| i.id == id).map(|i| i.progress)
         };
         match progress {
             Some(Progress::Confirmed) => {
-                let _g = agent.home.state_lock(name)?;
+                let _g = agent.home.state_lock(&key)?;
                 agent.remove_input()?;
                 return Ok(Attempt::Done);
             }
             Some(Progress::Rejected) => {
-                let _g = agent.home.state_lock(name)?;
+                let _g = agent.home.state_lock(&key)?;
                 agent.remove_input()?;
                 return Err(Error::Rejected(format!(
                     "{name} rejected the input (relay)"
@@ -234,7 +235,7 @@ pub fn attempt_input(
         }
         let signal = util::check_signal(sig).err();
         if signal.is_some() || Instant::now() >= deadline {
-            let _g = agent.home.state_lock(name)?;
+            let _g = agent.home.state_lock(&key)?;
             match settle_input(agent)? {
                 Some(Progress::Confirmed) => return Ok(Attempt::Done),
                 Some(Progress::Rejected) => {

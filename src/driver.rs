@@ -52,6 +52,7 @@ pub struct Prepared {
 /// Inputs to [`Driver::prepare`].
 pub struct PrepareCtx<'a> {
     pub exe: &'a Path,
+    pub project: &'a str,
     pub name: &'a str,
     pub instance: &'a str,
     /// Final path of the record's `driver/` directory.
@@ -248,8 +249,8 @@ fn hook_command(ctx: &PrepareCtx, driver: Driver, event: &str) -> String {
     let exe = util::sh_quote(&ctx.exe.to_string_lossy());
     match driver {
         Driver::Claude => format!(
-            "{exe} hook --agent {} --instance {} claude {event}",
-            ctx.name, ctx.instance
+            "{exe} hook --project {} --agent {} --instance {} claude {event}",
+            ctx.project, ctx.name, ctx.instance
         ),
         // Codex trusts hooks by their definition, so keep the command the
         // same for every agent: the agent and instance come from the
@@ -565,6 +566,7 @@ mod tests {
     fn ctx<'a>(dir: &'a Path) -> PrepareCtx<'a> {
         PrepareCtx {
             exe: Path::new("/opt/tmac bin/tmac"),
+            project: "p1",
             name: "a1",
             instance: "00000000-0000-4000-8000-000000000000",
             driver_dir: dir,
@@ -604,7 +606,7 @@ mod tests {
         assert_eq!(stop.len(), 2);
         assert_eq!(
             stop[1]["hooks"][0]["command"],
-            "'/opt/tmac bin/tmac' hook --agent a1 --instance 00000000-0000-4000-8000-000000000000 claude Stop"
+            "'/opt/tmac bin/tmac' hook --project p1 --agent a1 --instance 00000000-0000-4000-8000-000000000000 claude Stop"
         );
         let found = Driver::Claude.foreign_hooks(t.path(), &p);
         assert!(

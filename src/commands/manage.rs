@@ -10,14 +10,15 @@ use crate::driver::Driver;
 use crate::error::{Error, Result, warn};
 use crate::home::{Home, LockKind};
 use crate::ops;
+use crate::project::AgentRef;
 use crate::record::{self, Agent, HUMAN, HoldFile, State, UNCONFIRMED};
 use crate::tmux::Tmux;
 use crate::util;
 
 // ---- wait ----
 
-pub fn wait(name: &str, states: &[String], timeout: Option<f64>) -> Result<()> {
-    util::check_name(name)?;
+pub fn wait(agent_ref: &AgentRef, states: &[String], timeout: Option<f64>) -> Result<()> {
+    let name = &agent_ref.to_string();
     let mut targets = Vec::new();
     for s in states.iter().flat_map(|s| s.split(',')) {
         let s = s.trim();
@@ -30,7 +31,7 @@ pub fn wait(name: &str, states: &[String], timeout: Option<f64>) -> Result<()> {
         targets.push(State::Idle);
     }
     let home = Home::resolve()?;
-    let agent = Agent::require(&home, name)?;
+    let agent = Agent::require(&home, agent_ref)?;
     let sig = util::signal_flag();
     let deadline = timeout.map(|t| Instant::now() + Duration::from_secs_f64(t));
     loop {
@@ -60,8 +61,13 @@ pub fn wait(name: &str, states: &[String], timeout: Option<f64>) -> Result<()> {
 
 // ---- hold / release ----
 
-pub fn hold(name: &str, key: Option<&str>, note: Option<&str>, timeout: Option<f64>) -> Result<()> {
-    util::check_name(name)?;
+pub fn hold(
+    agent_ref: &AgentRef,
+    key: Option<&str>,
+    note: Option<&str>,
+    timeout: Option<f64>,
+) -> Result<()> {
+    let name = &agent_ref.to_string();
     let key = key.unwrap_or("manual");
     if !util::valid_name(key) {
         return Err(Error::usage(format!("invalid hold key {key:?}")));
@@ -71,17 +77,17 @@ pub fn hold(name: &str, key: Option<&str>, note: Option<&str>, timeout: Option<f
     }
     let home = Home::resolve()?;
     let cfg = config::load(&home)?;
-    let agent = Agent::require(&home, name)?;
+    let agent = Agent::require(&home, agent_ref)?;
     let sig = util::signal_flag();
     let wait = timeout.unwrap_or(cfg.send_confirm_timeout + 60.0);
     // Waiting for the input lock lets any input in progress finish (§9.2).
     let _input = home.lock(
-        name,
+        agent_ref,
         LockKind::Input,
         Some(Duration::from_secs_f64(wait)),
         Some(&sig),
     )?;
-    let _g = home.state_lock(name)?;
+    let _g = home.state_lock(agent_ref)?;
     if !agent.still_current()? {
         return Err(Error::no_agent(name));
     }
@@ -99,11 +105,11 @@ pub fn hold(name: &str, key: Option<&str>, note: Option<&str>, timeout: Option<f
     Ok(())
 }
 
-pub fn release(name: &str, key: Option<&str>, all: bool) -> Result<()> {
-    util::check_name(name)?;
+pub fn release(agent_ref: &AgentRef, key: Option<&str>, all: bool) -> Result<()> {
+    let name = &agent_ref.to_string();
     let home = Home::resolve()?;
-    let agent = Agent::require(&home, name)?;
-    let _g = home.state_lock(name)?;
+    let agent = Agent::require(&home, agent_ref)?;
+    let _g = home.state_lock(agent_ref)?;
     let keys: Vec<String> = if all {
         agent.holds()?.into_iter().map(|h| h.key).collect()
     } else {
@@ -135,6 +141,7 @@ struct TmuxOut {
 
 #[derive(Serialize)]
 struct StatusOut {
+    project: String,
     name: String,
     instance: String,
     driver: String,
@@ -152,6 +159,7 @@ struct StatusOut {
 fn status_of(agent: &Agent) -> Result<StatusOut> {
     let (st, pane) = ops::reconcile(agent)?;
     Ok(StatusOut {
+        project: agent.project().into(),
         name: agent.name().into(),
         instance: agent.instance().into(),
         driver: agent.info.driver.clone(),
@@ -173,10 +181,9 @@ fn status_of(agent: &Agent) -> Result<StatusOut> {
     })
 }
 
-pub fn status(name: &str, field: Option<&str>) -> Result<()> {
-    util::check_name(name)?;
+pub fn status(agent_ref: &AgentRef, field: Option<&str>) -> Result<()> {
     let home = Home::resolve()?;
-    let agent = Agent::require(&home, name)?;
+    let agent = Agent::require(&home, agent_ref)?;
     let out = status_of(&agent)?;
     let value = serde_json::to_value(&out).map_err(|e| Error::runtime(e.to_string()))?;
     match field {
@@ -208,15 +215,16 @@ fn age(stamp: &str) -> String {
     }
 }
 
-pub fn list(quiet: bool) -> Result<()> {
+/// `project`: `None` lists every project (`-a`).
+pub fn list(quiet: bool, project: Option<&str>) -> Result<()> {
     let home = Home::resolve()?;
     let mut rows = Vec::new();
-    for name in record::list_names(&home)? {
+    for agent_ref in record::list(&home, project)? {
         if quiet {
-            println!("{name}");
+            println!("{agent_ref}");
             continue;
         }
-        let agent = match Agent::load(&home, &name) {
+        let agent = match Agent::load(&home, &agent_ref) {
             Ok(Some(a)) => a,
             Ok(None) => continue,
             Err(e) => {
@@ -226,7 +234,7 @@ pub fn list(quiet: bool) -> Result<()> {
         };
         match status_of(&agent) {
             Ok(s) => rows.push([
-                s.name,
+                format!("{}/{}", s.project, s.name),
                 s.driver,
                 s.state,
                 age(&s.since),
@@ -267,20 +275,20 @@ pub fn list(quiet: bool) -> Result<()> {
 
 // ---- kill ----
 
-pub fn kill(name: &str, timeout: Option<f64>, force: bool) -> Result<()> {
-    util::check_name(name)?;
+pub fn kill(agent_ref: &AgentRef, timeout: Option<f64>, force: bool) -> Result<()> {
+    let name = &agent_ref.to_string();
     let home = Home::resolve()?;
     let cfg = config::load(&home)?;
-    let agent = Agent::require(&home, name)?;
+    let agent = Agent::require(&home, agent_ref)?;
     let sig = util::signal_flag();
-    let _input = home.lock(name, LockKind::Input, None, Some(&sig))?;
+    let _input = home.lock(agent_ref, LockKind::Input, None, Some(&sig))?;
     if !agent.still_current()? {
         return Err(Error::NoAgent(format!(
             "agent {name} is gone or was replaced"
         )));
     }
     {
-        let _g = home.state_lock(name)?;
+        let _g = home.state_lock(agent_ref)?;
         let st = agent.state()?;
         agent.expire_holds(&st)?;
         let holds = agent.active_holds(&st)?;

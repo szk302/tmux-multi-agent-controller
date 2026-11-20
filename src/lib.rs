@@ -8,6 +8,7 @@ pub mod driver;
 pub mod error;
 pub mod home;
 pub mod ops;
+pub mod project;
 pub mod record;
 pub mod tmux;
 pub mod util;
@@ -37,9 +38,13 @@ pub fn run() -> i32 {
             };
         }
     };
+    let project = cli.project;
+    let pr = project.as_deref();
+    let target = |name: &str| project::agent_ref(name, pr);
     let result = match cli.cmd {
         Cmd::Hook(h) => {
             return hook::run(hook::HookArgs {
+                project,
                 agent: h.agent,
                 instance: h.instance,
                 driver: h.driver,
@@ -47,6 +52,7 @@ pub fn run() -> i32 {
             });
         }
         Cmd::Spawn(s) => spawn::run(spawn::SpawnArgs {
+            project,
             name: s.name,
             driver: s.driver,
             cwd: s.cwd,
@@ -60,6 +66,7 @@ pub fn run() -> i32 {
             command: s.command,
         }),
         Cmd::Send(s) => input::send(input::SendArgs {
+            project,
             name: s.name,
             text: s.text,
             file: s.file,
@@ -67,16 +74,29 @@ pub fn run() -> i32 {
             no_wait: s.no_wait,
         }),
         Cmd::Wake(w) => input::wake(input::WakeArgs {
+            project,
             name: w.name,
             text: w.text,
             timeout: w.timeout,
         }),
-        Cmd::Wait(w) => manage::wait(&w.name, &w.state, w.timeout),
-        Cmd::Hold(h) => manage::hold(&h.name, h.key.as_deref(), h.note.as_deref(), h.timeout),
-        Cmd::Release(r) => manage::release(&r.name, r.key.as_deref(), r.all),
-        Cmd::Status(s) => manage::status(&s.name, s.field.as_deref()),
-        Cmd::List(l) => manage::list(l.quiet),
-        Cmd::Kill(k) => manage::kill(&k.name, k.timeout, k.force),
+        Cmd::Wait(w) => target(&w.name).and_then(|r| manage::wait(&r, &w.state, w.timeout)),
+        Cmd::Hold(h) => target(&h.name)
+            .and_then(|r| manage::hold(&r, h.key.as_deref(), h.note.as_deref(), h.timeout)),
+        Cmd::Release(r) => {
+            target(&r.name).and_then(|a| manage::release(&a, r.key.as_deref(), r.all))
+        }
+        Cmd::Status(s) => target(&s.name).and_then(|r| manage::status(&r, s.field.as_deref())),
+        Cmd::List(l) => {
+            if l.all {
+                manage::list(l.quiet, None)
+            } else {
+                std::env::current_dir()
+                    .map_err(error::Error::from)
+                    .and_then(|d| project::resolve(pr, &d))
+                    .and_then(|p| manage::list(l.quiet, Some(&p)))
+            }
+        }
+        Cmd::Kill(k) => target(&k.name).and_then(|r| manage::kill(&r, k.timeout, k.force)),
     };
     match result {
         Ok(()) => 0,

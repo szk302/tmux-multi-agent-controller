@@ -12,7 +12,8 @@ use crate::home::Home;
 /// Settings with built-in defaults applied.
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub tmux_session: String,
+    /// `None`: a session per project (§12.2).
+    pub tmux_session: Option<String>,
     pub tmux_socket_name: Option<String>,
     pub spawn_timeout: f64,
     pub send_settle_sec: f64,
@@ -30,7 +31,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            tmux_session: "tmac".into(),
+            tmux_session: None,
             tmux_socket_name: None,
             spawn_timeout: 60.0,
             send_settle_sec: 10.0,
@@ -116,7 +117,7 @@ pub fn parse(text: &str) -> std::result::Result<Config, String> {
             "tmux" => {
                 for (k2, v2) in mapping(v, "tmux")? {
                     match k2.as_str().unwrap_or_default() {
-                        "session" => cfg.tmux_session = string(v2, "tmux.session")?,
+                        "session" => cfg.tmux_session = Some(string(v2, "tmux.session")?),
                         "socket_name" => {
                             cfg.tmux_socket_name = Some(string(v2, "tmux.socket_name")?)
                         }
@@ -218,13 +219,13 @@ mod tests {
     #[test]
     fn defaults_and_overrides() {
         let c = parse("").unwrap();
-        assert_eq!(c.tmux_session, "tmac");
+        assert_eq!(c.tmux_session, None);
         assert_eq!(c.send_settle_sec, 10.0);
         let c = parse(
             "tmux:\n  session: agents\nrelay:\n  timeout: 5\n  claude:\n    Stop: lmm hook\nsend:\n  settle_sec: 30\nhold:\n  human_sec: 600\ndrivers:\n  codex:\n    submit_delay_ms: 700\n",
         )
         .unwrap();
-        assert_eq!(c.tmux_session, "agents");
+        assert_eq!(c.tmux_session.as_deref(), Some("agents"));
         assert_eq!(c.relay_timeout, 5.0);
         assert_eq!(c.relay["claude"]["Stop"], "lmm hook");
         assert_eq!(c.send_settle_sec, 30.0);

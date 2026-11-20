@@ -8,10 +8,12 @@ use crate::config;
 use crate::error::{Error, Result};
 use crate::home::Home;
 use crate::ops::{self, Attempt};
+use crate::project;
 use crate::record::{Agent, State};
 use crate::util;
 
 pub struct SendArgs {
+    pub project: Option<String>,
     pub name: String,
     pub text: Option<String>,
     pub file: Option<PathBuf>,
@@ -20,6 +22,7 @@ pub struct SendArgs {
 }
 
 pub struct WakeArgs {
+    pub project: Option<String>,
     pub name: String,
     pub text: Option<String>,
     pub timeout: Option<f64>,
@@ -61,11 +64,12 @@ fn live(agent: &Agent) -> Result<crate::record::StateFile> {
 }
 
 pub fn send(a: SendArgs) -> Result<()> {
-    util::check_name(&a.name)?;
+    let r = project::agent_ref(&a.name, a.project.as_deref())?;
+    let name = r.to_string();
     let home = Home::resolve()?;
     let cfg = config::load(&home)?;
     let text = ops::prepare_text(&read_text(a.text, a.file)?, cfg.send_max_bytes)?;
-    let agent = Agent::require(&home, &a.name)?;
+    let agent = Agent::require(&home, &r)?;
     let sig = util::signal_flag();
     let deadline = a
         .timeout
@@ -83,18 +87,18 @@ pub fn send(a: SendArgs) -> Result<()> {
                 Ok(Attempt::Done) => return Ok(()),
                 Ok(Attempt::NotReady) => {}
                 Err(Error::Timeout(_)) if a.no_wait => {
-                    return Err(Error::NotReady(format!("{} is taking other input", a.name)));
+                    return Err(Error::NotReady(format!("{} is taking other input", name)));
                 }
                 Err(e) => return Err(e),
             }
         }
         if a.no_wait {
-            return Err(Error::NotReady(format!("{} cannot take input now", a.name)));
+            return Err(Error::NotReady(format!("{} cannot take input now", name)));
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(Error::Timeout(format!(
                 "{} did not become ready for input in time",
-                a.name
+                name
             )));
         }
         util::sleep_checked(Duration::from_millis(500), &sig)?;
@@ -102,11 +106,12 @@ pub fn send(a: SendArgs) -> Result<()> {
 }
 
 pub fn wake(a: WakeArgs) -> Result<()> {
-    util::check_name(&a.name)?;
+    let r = project::agent_ref(&a.name, a.project.as_deref())?;
+    let name = r.to_string();
     let home = Home::resolve()?;
     let cfg = config::load(&home)?;
     let text = ops::prepare_text(&read_text(a.text, None)?, cfg.send_max_bytes)?;
-    let agent = Agent::require(&home, &a.name)?;
+    let agent = Agent::require(&home, &r)?;
     let sig = util::signal_flag();
     let start_seq = agent.state()?.stop_seq;
     let deadline = a
@@ -128,7 +133,7 @@ pub fn wake(a: WakeArgs) -> Result<()> {
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(Error::Timeout(format!(
                 "{} did not stop or become ready in time",
-                a.name
+                name
             )));
         }
         util::sleep_checked(Duration::from_millis(500), &sig)?;

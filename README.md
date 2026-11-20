@@ -5,6 +5,7 @@
 - 状態（`starting`・`idle`・`busy`・`waiting`・`exited`）は、CLI のフックで知ります。画面の文字は読みません。
 - 常駐プロセスはありません。記録は `~/.tmac/agents/<名前>/` の YAML ファイルで、`ls` と `cat` で追えます。
 - 入力は、名前付きバッファとブラケットペーストで貼り付け、`UserPromptSubmit` のフックで受け付けられたことを確かめます。確かめられなければ、再送せずに後続の入力を止めます。
+- エージェントは、docker compose と同じく、リポジトリ名のプロジェクトごとに分かれます。複数のリポジトリで同じ名前を使っても衝突しません。
 - ワークフロー（[Dagu](https://github.com/dagu-org/dagu) など）、ほかの AI、人の手作業のどれからも、同じコマンドで呼べます。メッセージは [lmm](https://github.com/szk302/local-markdown-mail) と組み合わせます。
 
 仕様は [docs/prd.md](docs/prd.md) を参照してください。
@@ -23,18 +24,33 @@ cargo install --locked --path .
 ## 使い方
 
 ```bash
-# 起動して、入力を受け付けられるようになるまで待つ（"NAME PANE_ID" を出力）
+# 起動して、入力を受け付けられるようになるまで待つ（"repo/impl-001 %3" のように出力）
 tmac spawn impl-001 --cwd ~/work/repo/.worktree/feat/x --pass-env PATH -- claude
-tmux attach -t tmac                         # ペインを見る（ウィンドウ名がエージェント名）
+tmux attach -t repo                         # ペインを見る（セッションはプロジェクト、ウィンドウはエージェント名）
 
 tmac send impl-001 "README の誤字を直してください"   # 入力できるまで待って入力する
 tmac wait impl-001                          # idle になるまで待つ
 tmac status impl-001                        # 状態を YAML で表示する
-tmac list                                   # 一覧
+tmac list                                   # このプロジェクトの一覧（-a ですべてのプロジェクト）
 
 tmac hold impl-001 --note "仕様を確認中"    # 自動の入力を止める（実行中の入力が終わるまで待つ）
 tmac release impl-001
 tmac kill impl-001                          # 終了して、ペインと記録を削除する
+```
+
+### プロジェクト
+
+エージェントは「プロジェクト/名前」で識別します。プロジェクトは docker compose と同じく、次の順で決まります。
+
+1. `-p, --project <PROJECT>`（すべてのコマンドに共通）
+2. 環境変数 `TMAC_PROJECT`
+3. ディレクトリが属するリポジトリの名前（`spawn` はエージェントの作業ディレクトリ、それ以外はカレントディレクトリで決める）。worktree の中ではメインのリポジトリ名になります。git の外ではディレクトリ名です。英大文字は小文字に、使えない文字は `-` に直します。
+
+```bash
+cd ~/work/repo && tmac send impl-001 "..."   # リポジトリの中なら短い名前で指せる
+tmac status repo/impl-001                      # どこからでも「プロジェクト/名前」で指せる
+tmac -p repo kill impl-001
+tmac list -a                                   # すべてのプロジェクト
 ```
 
 ### メッセージ（lmm）と組み合わせる
@@ -67,7 +83,7 @@ tmac spawn impl-001 --relay 'Stop=lmm hook' --env LMM_NAME=impl-001 --pass-env P
 
 ```yaml
 tmux:
-  session: agents        # spawn がウィンドウを作るセッション（既定: tmac）
+  session: agents        # spawn がウィンドウを作るセッション（既定: プロジェクトごと）
 send:
   settle_sec: 10         # idle がこの秒数続いたら入力する
 hold:
