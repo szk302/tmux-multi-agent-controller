@@ -191,6 +191,10 @@ def main():
                 interrupted()
                 return
             fire("PostToolUse", tool_name="Bash")
+        if words[:1] == ["selfnote"]:
+            # Like Claude Code delivering a background task notice mid-turn.
+            fire("UserPromptSubmit", prompt="<task-notification>\n<task-id>t1</task-id>\n"
+                 "<status>completed</status>\n</task-notification>")
         if words[:1] == ["ask"]:
             fire("PermissionRequest", tool_name="Bash")
             if wait_for_key("y", 60) == "esc":
