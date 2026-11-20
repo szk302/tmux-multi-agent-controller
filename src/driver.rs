@@ -202,6 +202,17 @@ impl Driver {
         }
     }
 
+    /// Whether a submitted prompt was made by the CLI itself rather than
+    /// typed: Claude Code hands notices of finished background tasks to the
+    /// model as prompts (`<task-notification>`) and fires UserPromptSubmit
+    /// for them (§9.3).
+    pub fn generated_prompt(self, prompt: &str) -> bool {
+        match self {
+            Driver::Claude => prompt.trim_start().starts_with("<task-notification>"),
+            Driver::Codex => false,
+        }
+    }
+
     /// Whether the relay stopped the stop or rejected the input (§6.3).
     pub fn relay_blocked(self, code: i32, stdout: &[u8]) -> bool {
         if code == 2 {
@@ -663,6 +674,13 @@ mod tests {
         let p = Driver::Codex.prepare(&ctx(t.path()), &cmd).unwrap();
         assert_eq!(&p.command[..4], ["env", "A=1", "codex", "-c"]);
         assert_eq!(p.command.last().unwrap(), "hi");
+    }
+
+    #[test]
+    fn generated_prompts() {
+        assert!(Driver::Claude.generated_prompt("<task-notification>\n<task-id>x</task-id>"));
+        assert!(!Driver::Claude.generated_prompt("please look at <task-notification>"));
+        assert!(!Driver::Codex.generated_prompt("<task-notification>"));
     }
 
     #[test]

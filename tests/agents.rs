@@ -96,6 +96,23 @@ fn human_input_holds_tmac_input() {
 }
 
 #[test]
+fn prompts_made_by_the_cli_are_not_human_input() {
+    let env = Env::new();
+    env.spawn("g1", "claude", &[], &[]);
+    env.ok(&["send", "g1", "selfnote"]);
+    env.ok(&["wait", "g1", "--timeout", "10"]);
+    env.until("the notice prompt", || {
+        env.events("g1")
+            .iter()
+            .filter(|e| e["event"] == "UserPromptSubmit")
+            .count()
+            == 2
+    });
+    assert!(env.status("g1")["holds"].as_sequence().unwrap().is_empty());
+    env.ok(&["kill", "g1"]);
+}
+
+#[test]
 fn manual_hold_and_release() {
     let env = Env::new();
     env.spawn("m1", "claude", &[], &[]);

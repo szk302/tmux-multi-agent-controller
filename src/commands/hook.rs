@@ -83,7 +83,7 @@ pub fn run(args: HookArgs) -> i32 {
 
     let mut failed = false;
     let before = driver.before(event, &json);
-    let logged = match apply_before(&agent, before, event, &json) {
+    let logged = match apply_before(&agent, driver, before, event, &json) {
         Ok(Some(logged)) => logged,
         Ok(None) => {
             warn(format!("ignoring {event} hook: {key} was replaced"));
@@ -125,6 +125,7 @@ pub fn run(args: HookArgs) -> i32 {
 /// otherwise whether the event was logged.
 fn apply_before(
     agent: &Agent,
+    driver: Driver,
     before: Before,
     event: &str,
     payload: &Value,
@@ -149,7 +150,7 @@ fn apply_before(
             true
         }
         Before::Prompt => {
-            match_prompt(agent, payload, st.state)?;
+            match_prompt(agent, driver, payload, st.state)?;
             agent.transition(&mut st, State::Busy, "hook", event)?;
             true
         }
@@ -162,7 +163,7 @@ fn apply_before(
 
 /// Match a submitted prompt against tmac's input; otherwise treat it as a
 /// person typing in the pane (§7.4, §9.3).
-fn match_prompt(agent: &Agent, payload: &Value, state: State) -> Result<()> {
+fn match_prompt(agent: &Agent, driver: Driver, payload: &Value, state: State) -> Result<()> {
     let prompt = payload.get("prompt").and_then(Value::as_str).unwrap_or("");
     let hash = util::text_hash(prompt);
     let mut ours = false;
@@ -181,7 +182,12 @@ fn match_prompt(agent: &Agent, payload: &Value, state: State) -> Result<()> {
     }
     // A prompt during start-up comes from the command line (a first
     // prompt), not from a person typing.
-    if !ours && state != State::Starting && agent.info.human_hold > 0.0 {
+    // Prompts the CLI makes itself (notices of background tasks) are not typed either.
+    if !ours
+        && state != State::Starting
+        && !driver.generated_prompt(prompt)
+        && agent.info.human_hold > 0.0
+    {
         agent.write_hold(&HoldFile {
             key: HUMAN.into(),
             note: Some("input typed in the pane".into()),
