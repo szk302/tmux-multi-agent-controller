@@ -25,7 +25,10 @@ fn spawn_send_status_and_kill() {
 
     // Multi-line Japanese text arrives as one prompt.
     env.ok(&["send", "a1", "こんにちは\n二行目\tタブ"]);
-    assert_eq!(env.prompts("a1"), ["こんにちは\n二行目\tタブ"]);
+    // The fake CLI logs after the hook returns: wait for the log.
+    env.until("the prompt", || {
+        env.prompts("a1") == ["こんにちは\n二行目\tタブ"]
+    });
     assert_eq!(env.status("a1")["holds"].as_sequence().unwrap().len(), 0);
     assert!(!env.agent_dir("a1").join("input.yml").exists());
     env.ok(&["wait", "a1", "--timeout", "10"]);
@@ -34,7 +37,9 @@ fn spawn_send_status_and_kill() {
     let f = env.tmp.path().join("req.txt");
     std::fs::write(&f, "from file\n").unwrap();
     env.ok(&["send", "a1", "-f", f.to_str().unwrap()]);
-    assert_eq!(env.prompts("a1").last().unwrap(), "from file");
+    env.until("the prompt from the file", || {
+        env.prompts("a1").last().is_some_and(|p| p == "from file")
+    });
 
     // The pane shows its state through pane options.
     let opt = env.tmux(&["show-options", "-p", "-t", "=t:=a1", "-v", "@tmac_state"]);
@@ -66,7 +71,11 @@ fn human_input_holds_tmac_input() {
     env.expect(&["kill", "h1"], 5);
     // The hold ends human_sec (2 s) after the agent became idle.
     env.ok(&["send", "h1", "--timeout", "15", "after the hold"]);
-    assert_eq!(env.prompts("h1").last().unwrap(), "after the hold");
+    env.until("the prompt after the hold", || {
+        env.prompts("h1")
+            .last()
+            .is_some_and(|p| p == "after the hold")
+    });
     assert!(!env.agent_dir("h1").join("holds/human.yml").exists());
     // Once it ran out, the hold does not return when the agent is idle again.
     env.ok(&["wait", "h1", "--timeout", "10"]);
@@ -112,7 +121,11 @@ fn wake_waits_for_a_stop_or_types_when_idle() {
     assert!(!env.prompts("w1").contains(&"news while busy".to_string()));
     // Idle: wake types the text.
     env.ok(&["wake", "w1", "news while idle", "--timeout", "15"]);
-    assert_eq!(env.prompts("w1").last().unwrap(), "news while idle");
+    env.until("the news", || {
+        env.prompts("w1")
+            .last()
+            .is_some_and(|p| p == "news while idle")
+    });
     env.ok(&["kill", "w1"]);
 }
 
@@ -141,13 +154,15 @@ fn relay_can_continue_the_stop_and_reject_input() {
     env.spawn("r1", "claude", &["--relay", &stop, "--relay", prompt], &[]);
     env.ok(&["send", "r1", "first"]);
     env.ok(&["wait", "r1", "--timeout", "10"]);
-    let ev = env.events("r1");
-    assert!(ev.iter().any(|e| e["event"] == "continued"));
+    env.until("the continued stop", || {
+        env.events("r1").iter().any(|e| e["event"] == "continued")
+    });
     // The relay's stdout reaches the CLI unchanged.
-    assert!(
-        ev.iter()
+    env.until("the relay output", || {
+        env.events("r1")
+            .iter()
             .any(|e| e["event"] == "Stop" && e["out"] == "plain")
-    );
+    });
     let log = std::fs::read_to_string(env.agent_dir("r1").join("events.log")).unwrap();
     assert!(log.contains("Stop(continued)"), "{log}");
 
@@ -165,6 +180,9 @@ fn relay_timeout_is_enforced() {
     env.ok(&["send", "t1", "x"]);
     env.ok(&["wait", "t1", "--timeout", "15"]);
     assert!(start.elapsed() < Duration::from_secs(10));
+    env.until("the Stop hook", || {
+        env.events("t1").iter().any(|e| e["event"] == "Stop")
+    });
     let stop = env
         .events("t1")
         .into_iter()
@@ -241,7 +259,9 @@ fn codex_driver() {
     assert_eq!(state(&env, "c1"), "busy");
     env.tmux(&["send-keys", "-t", "=t:=c1", "Escape"]);
     env.ok(&["wait", "c1", "--timeout", "10"]);
-    assert!(env.events("c1").iter().any(|e| e["event"] == "Interrupt"));
+    env.until("the Interrupt hook", || {
+        env.events("c1").iter().any(|e| e["event"] == "Interrupt")
+    });
     env.ok(&["kill", "c1"]);
     assert!(
         env.events("c1").iter().any(|e| e["event"] == "exit"),
