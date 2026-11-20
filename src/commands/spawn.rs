@@ -143,11 +143,16 @@ pub fn run(a: SpawnArgs) -> Result<()> {
         &a.command,
     )?;
     if !a.allow_foreign_hooks {
-        let found = driver.foreign_hooks(&cwd, &prepared);
+        let found: Vec<String> = driver
+            .foreign_hooks(&cwd, &prepared)
+            .into_iter()
+            .filter(|place| !cfg.allow_foreign_hooks.allows(place))
+            .collect();
         if !found.is_empty() {
             let mut msg = String::from(
                 "hooks other than tmac's can block Stop or UserPromptSubmit, so tmac cannot tell the state \
-                 reliably. Move them to --relay, or pass --allow-foreign-hooks if they never block:",
+                 reliably. Move them to --relay, or pass --allow-foreign-hooks (or list them in \
+                 spawn.allow_foreign_hooks of the configuration) if they never block:",
             );
             for f in found {
                 msg.push_str("\n  ");

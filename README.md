@@ -88,6 +88,9 @@ send:
   settle_sec: 10         # idle がこの秒数続いたら入力する
 hold:
   human_sec: 300         # 人の入力を検出した後に止める秒数
+spawn:
+  allow_foreign_hooks:   # 停止を止めないと分かっている、ほかのフック（spawn が示す場所の先頭）
+    - plugin codex@openai-codex
 relay:
   claude:
     Stop: lmm hook       # 中継（spawn --relay で上書きできる）

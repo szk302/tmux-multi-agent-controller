@@ -55,7 +55,7 @@ impl Env {
         std::fs::write(
             home.join("config.yml"),
             format!(
-                "tmux:\n  socket_name: {socket}\nspawn:\n  timeout: 20\nsend:\n  settle_sec: 0.3\n  confirm_timeout: 3\nhold:\n  human_sec: 2\nkill:\n  timeout: 5\ndrivers:\n  claude:\n    submit_delay_ms: 100\n  codex:\n    submit_delay_ms: 100\n{extra}"
+                "tmux:\n  socket_name: {socket}\nsend:\n  settle_sec: 0.3\n  confirm_timeout: 3\nhold:\n  human_sec: 2\nkill:\n  timeout: 5\ndrivers:\n  claude:\n    submit_delay_ms: 100\n  codex:\n    submit_delay_ms: 100\n{extra}"
             ),
         )
         .unwrap();
