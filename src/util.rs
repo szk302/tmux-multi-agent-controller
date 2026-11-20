@@ -265,11 +265,22 @@ pub fn process_start_time(pid: u32) -> Option<String> {
 #[cfg(not(target_os = "linux"))]
 pub fn process_start_time(pid: u32) -> Option<String> {
     let out = std::process::Command::new("ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .args(["-o", "stat=", "-o", "lstart=", "-p", &pid.to_string()])
         .output()
         .ok()?;
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (out.status.success() && !s.is_empty()).then_some(s)
+    if !out.status.success() {
+        return None;
+    }
+    parse_ps_start(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Start time from `ps -o stat= -o lstart=`; `None` for a zombie, which has
+/// ended and only waits to be reaped.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn parse_ps_start(out: &str) -> Option<String> {
+    let (stat, start) = out.trim().split_once(char::is_whitespace)?;
+    let start = start.trim();
+    (!stat.starts_with('Z') && !start.is_empty()).then(|| start.to_string())
 }
 
 /// Whether `pid` is still the process that started at `start`.
@@ -325,6 +336,16 @@ mod tests {
         assert_eq!(sh_quote("/usr/bin/tmac"), "/usr/bin/tmac");
         assert_eq!(sh_quote("a b"), "'a b'");
         assert_eq!(sh_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn ps_output() {
+        assert_eq!(
+            parse_ps_start("Ss   Sat Nov 21 04:29:43 2026\n").as_deref(),
+            Some("Sat Nov 21 04:29:43 2026")
+        );
+        assert_eq!(parse_ps_start("Z    Sat Nov 21 04:29:43 2026\n"), None);
+        assert_eq!(parse_ps_start(""), None);
     }
 
     #[test]
