@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
+use crate::project::AgentRef;
 use crate::util;
 
 /// The resolved data directory.
@@ -55,8 +56,8 @@ impl Home {
         self.root.join("agents")
     }
 
-    pub fn agent_dir(&self, name: &str) -> PathBuf {
-        self.agents().join(name)
+    pub fn agent_dir(&self, agent: &AgentRef) -> PathBuf {
+        self.agents().join(&agent.project).join(&agent.name)
     }
 
     pub fn creating(&self) -> PathBuf {
@@ -67,31 +68,32 @@ impl Home {
         self.agents().join(".removing")
     }
 
-    pub fn lock_path(&self, name: &str, kind: LockKind) -> PathBuf {
+    pub fn lock_path(&self, agent: &AgentRef, kind: LockKind) -> PathBuf {
         let suffix = match kind {
             LockKind::Input => "input",
             LockKind::State => "state",
         };
         self.root
             .join("locks")
-            .join(format!("{name}.{suffix}.lock"))
+            .join(&agent.project)
+            .join(format!("{}.{suffix}.lock", agent.name))
     }
 
     /// Acquire a lock. `timeout` of `None` waits without a limit; a signal
     /// recorded in `stop` ends the wait.
     pub fn lock(
         &self,
-        name: &str,
+        agent: &AgentRef,
         kind: LockKind,
         timeout: Option<Duration>,
         stop: Option<&AtomicUsize>,
     ) -> Result<LockGuard> {
-        lock_path_with(&self.lock_path(name, kind), timeout, stop)
+        lock_path_with(&self.lock_path(agent, kind), timeout, stop)
     }
 
     /// Acquire the state lock (held only briefly by everyone).
-    pub fn state_lock(&self, name: &str) -> Result<LockGuard> {
-        self.lock(name, LockKind::State, Some(Duration::from_secs(30)), None)
+    pub fn state_lock(&self, agent: &AgentRef) -> Result<LockGuard> {
+        self.lock(agent, LockKind::State, Some(Duration::from_secs(30)), None)
     }
 }
 

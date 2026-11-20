@@ -13,10 +13,12 @@ use crate::driver::{After, Before, Driver};
 use crate::error::{Result, warn};
 use crate::home::Home;
 use crate::ops;
+use crate::project::AgentRef;
 use crate::record::{Agent, HUMAN, HoldFile, Progress, State, UNCONFIRMED};
 use crate::util;
 
 pub struct HookArgs {
+    pub project: Option<String>,
     pub agent: Option<String>,
     pub instance: Option<String>,
     pub driver: String,
@@ -27,6 +29,10 @@ pub struct HookArgs {
 pub fn run(args: HookArgs) -> i32 {
     let mut payload = Vec::new();
     let _ = io::stdin().read_to_end(&mut payload);
+    let project = args
+        .project
+        .or_else(|| std::env::var("TMAC_PROJECT").ok())
+        .filter(|s| !s.is_empty());
     let name = args
         .agent
         .or_else(|| std::env::var("TMAC_AGENT").ok())
@@ -35,17 +41,18 @@ pub fn run(args: HookArgs) -> i32 {
         .instance
         .or_else(|| std::env::var("TMAC_INSTANCE").ok())
         .filter(|s| !s.is_empty());
-    let (Some(name), Some(instance)) = (name, instance) else {
+    let (Some(project), Some(name), Some(instance)) = (project, name, instance) else {
         return 0;
     };
     let Some(driver) = Driver::from_name(&args.driver) else {
         eprintln!("tmac: hook: unknown driver {:?}", args.driver);
         return 1;
     };
-    if !util::valid_name(&name) {
-        eprintln!("tmac: hook: invalid agent name {name:?}");
+    if !util::valid_name(&name) || !util::valid_name(&project) {
+        eprintln!("tmac: hook: invalid agent {project}/{name}");
         return 1;
     }
+    let key = AgentRef { project, name };
     let home = match Home::resolve() {
         Ok(h) => h,
         Err(e) => {
@@ -53,11 +60,11 @@ pub fn run(args: HookArgs) -> i32 {
             return 1;
         }
     };
-    let agent = match Agent::load(&home, &name) {
+    let agent = match Agent::load(&home, &key) {
         Ok(Some(a)) if a.instance() == instance => a,
         Ok(_) => {
             warn(format!(
-                "ignoring {} hook of an earlier {name} ({instance})",
+                "ignoring {} hook of an earlier {key} ({instance})",
                 args.event
             ));
             return 0;
@@ -79,11 +86,11 @@ pub fn run(args: HookArgs) -> i32 {
     let logged = match apply_before(&agent, before, event, &json) {
         Ok(Some(logged)) => logged,
         Ok(None) => {
-            warn(format!("ignoring {event} hook: {name} was replaced"));
+            warn(format!("ignoring {event} hook: {key} was replaced"));
             return 0;
         }
         Err(e) => {
-            warn(format!("{event}: cannot update the state of {name}: {e}"));
+            warn(format!("{event}: cannot update the state of {key}: {e}"));
             failed = true;
             false
         }
@@ -102,7 +109,7 @@ pub fn run(args: HookArgs) -> i32 {
 
     let after = driver.after(event, &json);
     if let Err(e) = apply_after(&agent, after, event, blocked, logged) {
-        warn(format!("{event}: cannot update the state of {name}: {e}"));
+        warn(format!("{event}: cannot update the state of {key}: {e}"));
         failed = true;
     }
     if relay.is_some() {
@@ -122,7 +129,7 @@ fn apply_before(
     event: &str,
     payload: &Value,
 ) -> Result<Option<bool>> {
-    let _g = agent.home.state_lock(agent.name())?;
+    let _g = agent.home.state_lock(&agent.key())?;
     if !agent.still_current()? {
         return Ok(None);
     }
@@ -195,7 +202,7 @@ fn apply_after(
     blocked: bool,
     logged: bool,
 ) -> Result<()> {
-    let _g = agent.home.state_lock(agent.name())?;
+    let _g = agent.home.state_lock(&agent.key())?;
     if !agent.still_current()? {
         return Ok(());
     }

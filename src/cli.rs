@@ -11,6 +11,10 @@ use clap::{Args, Parser, Subcommand};
     about = "Run hook-capable AI CLIs in tmux panes and type into them only when they can take input"
 )]
 pub struct Cli {
+    /// Project of the agents (default: $TMAC_PROJECT, else the repository of
+    /// the directory, like docker compose)
+    #[arg(short = 'p', long, global = true, value_name = "PROJECT")]
+    pub project: Option<String>,
     #[command(subcommand)]
     pub cmd: Cmd,
 }
@@ -157,6 +161,9 @@ pub struct ListCli {
     /// Print names only
     #[arg(short = 'q')]
     pub quiet: bool,
+    /// List the agents of every project
+    #[arg(short = 'a', long)]
+    pub all: bool,
 }
 
 #[derive(Args, Debug)]

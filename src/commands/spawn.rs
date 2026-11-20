@@ -9,11 +9,13 @@ use crate::driver::{Driver, PrepareCtx};
 use crate::error::{Error, Result};
 use crate::home::Home;
 use crate::ops;
+use crate::project::{self, AgentRef};
 use crate::record::{self, Agent, AgentFile, State, TmuxInfo};
 use crate::tmux::{Tmux, escape_arg};
 use crate::util;
 
 pub struct SpawnArgs {
+    pub project: Option<String>,
     pub name: String,
     pub driver: Option<String>,
     pub cwd: Option<PathBuf>,
@@ -27,7 +29,7 @@ pub struct SpawnArgs {
     pub command: Vec<String>,
 }
 
-const RESERVED_ENV: &[&str] = &["TMAC_AGENT", "TMAC_INSTANCE", "TMAC_HOME"];
+const RESERVED_ENV: &[&str] = &["TMAC_PROJECT", "TMAC_AGENT", "TMAC_INSTANCE", "TMAC_HOME"];
 
 fn valid_env_key(k: &str) -> bool {
     let b = k.as_bytes();
@@ -37,7 +39,6 @@ fn valid_env_key(k: &str) -> bool {
 }
 
 pub fn run(a: SpawnArgs) -> Result<()> {
-    util::check_name(&a.name)?;
     if a.command.is_empty() {
         return Err(Error::usage("give the command after --"));
     }
@@ -61,6 +62,8 @@ pub fn run(a: SpawnArgs) -> Result<()> {
         .ok()
         .filter(|p| p.is_dir())
         .ok_or_else(|| Error::usage(format!("not a directory: {}", cwd.display())))?;
+    // The project of an agent is the repository it works in (§3.1).
+    let key = AgentRef::parse(&a.name, || project::resolve(a.project.as_deref(), &cwd))?;
 
     let mut env_pairs: Vec<(String, String)> = Vec::new();
     for kv in &a.env {
@@ -111,7 +114,8 @@ pub fn run(a: SpawnArgs) -> Result<()> {
     let session = a
         .session
         .clone()
-        .unwrap_or_else(|| cfg.tmux_session.clone());
+        .or_else(|| cfg.tmux_session.clone())
+        .unwrap_or_else(|| project::session_name(&key.project));
     if session.is_empty() || session.contains([':', '.']) {
         return Err(Error::usage(format!(
             "invalid tmux session name {session:?}"
@@ -125,11 +129,12 @@ pub fn run(a: SpawnArgs) -> Result<()> {
 
     let instance = uuid::Uuid::new_v4().hyphenated().to_string();
     let exe = std::env::current_exe()?.canonicalize()?;
-    let driver_dir = home.agent_dir(&a.name).join("driver");
+    let driver_dir = home.agent_dir(&key).join("driver");
     let prepared = driver.prepare(
         &PrepareCtx {
             exe: &exe,
-            name: &a.name,
+            project: &key.project,
+            name: &key.name,
             instance: &instance,
             driver_dir: &driver_dir,
             cwd: &cwd,
@@ -152,19 +157,19 @@ pub fn run(a: SpawnArgs) -> Result<()> {
         }
     }
 
-    if let Some(old) = Agent::load(&home, &a.name)? {
+    if let Some(old) = Agent::load(&home, &key)? {
         let exited = ops::reconcile(&old)
             .map(|(st, _)| st.state == State::Exited)
             .unwrap_or(false);
         let hint = if exited { " (it has exited)" } else { "" };
         return Err(Error::runtime(format!(
-            "agent {} already exists{hint}; run `tmac kill {}` first",
-            a.name, a.name
+            "agent {key} already exists{hint}; run `tmac kill {key}` first"
         )));
     }
 
     let mut env_all: Vec<(String, String)> = vec![
-        ("TMAC_AGENT".into(), a.name.clone()),
+        ("TMAC_PROJECT".into(), key.project.clone()),
+        ("TMAC_AGENT".into(), key.name.clone()),
         ("TMAC_INSTANCE".into(), instance.clone()),
         ("TMAC_HOME".into(), home.root.to_string_lossy().into_owned()),
     ];
@@ -179,7 +184,8 @@ pub fn run(a: SpawnArgs) -> Result<()> {
     env_all.extend(env_pairs.iter().cloned());
 
     let info = AgentFile {
-        name: a.name.clone(),
+        project: key.project.clone(),
+        name: key.name.clone(),
         instance: instance.clone(),
         driver: driver.name().into(),
         created_at: util::now_stamp(),
@@ -217,24 +223,21 @@ pub fn run(a: SpawnArgs) -> Result<()> {
         let (st, _) = ops::reconcile(&agent)?;
         match st.state {
             State::Idle => {
-                println!("{} {pane}", a.name);
+                println!("{key} {pane}");
                 return Ok(());
             }
             State::Exited => {
                 return Err(Error::runtime(format!(
-                    "{} exited during start-up; look at the pane, then run `tmac kill {}`",
-                    a.name, a.name
+                    "{key} exited during start-up; look at the pane, then run `tmac kill {key}`"
                 )));
             }
             _ => {}
         }
         if Instant::now() >= deadline {
             return Err(Error::Timeout(format!(
-                "{} is still {} after {timeout}s; look at the pane (a confirmation screen?) \
-                 or wait with `tmac wait {}`",
-                a.name,
-                st.state.as_str(),
-                a.name
+                "{key} is still {} after {timeout}s; look at the pane (a confirmation screen?) \
+                 or wait with `tmac wait {key}`",
+                st.state.as_str()
             )));
         }
         util::sleep_checked(Duration::from_millis(500), &sig)?;

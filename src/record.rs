@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::error::{Error, Result};
 use crate::home::Home;
+use crate::project::AgentRef;
 use crate::util;
 
 /// Agent state (§3.3).
@@ -63,6 +64,7 @@ pub struct TmuxInfo {
 /// `agent.yml`: facts fixed at spawn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentFile {
+    pub project: String,
     pub name: String,
     pub instance: String,
     pub driver: String,
@@ -170,9 +172,9 @@ pub fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 impl Agent {
-    /// Load the record of `name`; `None` if there is none.
-    pub fn load(home: &Home, name: &str) -> Result<Option<Agent>> {
-        let dir = home.agent_dir(name);
+    /// Load the record of an agent; `None` if there is none.
+    pub fn load(home: &Home, agent: &AgentRef) -> Result<Option<Agent>> {
+        let dir = home.agent_dir(agent);
         let Some(info) = read_yaml::<AgentFile>(&dir.join("agent.yml"))? else {
             return Ok(None);
         };
@@ -184,12 +186,29 @@ impl Agent {
     }
 
     /// Load and require a record (exit code 4 if missing).
-    pub fn require(home: &Home, name: &str) -> Result<Agent> {
-        Agent::load(home, name)?.ok_or_else(|| Error::no_agent(name))
+    pub fn require(home: &Home, agent: &AgentRef) -> Result<Agent> {
+        Agent::load(home, agent)?.ok_or_else(|| Error::no_agent(&agent.to_string()))
     }
 
+    /// Name within the project.
     pub fn name(&self) -> &str {
         &self.info.name
+    }
+
+    pub fn project(&self) -> &str {
+        &self.info.project
+    }
+
+    pub fn key(&self) -> AgentRef {
+        AgentRef {
+            project: self.info.project.clone(),
+            name: self.info.name.clone(),
+        }
+    }
+
+    /// `project/name`, for messages.
+    pub fn label(&self) -> String {
+        self.key().to_string()
     }
 
     pub fn instance(&self) -> &str {
@@ -198,7 +217,7 @@ impl Agent {
 
     /// Whether the record on disk still belongs to this instance.
     pub fn still_current(&self) -> Result<bool> {
-        Ok(Agent::load(&self.home, self.name())?
+        Ok(Agent::load(&self.home, &self.key())?
             .is_some_and(|a| a.info.instance == self.info.instance))
     }
 
@@ -208,7 +227,7 @@ impl Agent {
 
     pub fn state(&self) -> Result<StateFile> {
         read_yaml(&self.dir.join("state.yml"))?
-            .ok_or_else(|| Error::runtime(format!("missing state.yml for {}", self.name())))
+            .ok_or_else(|| Error::runtime(format!("missing state.yml for {}", self.label())))
     }
 
     pub fn write_state(&self, st: &StateFile) -> Result<()> {
@@ -272,7 +291,7 @@ impl Agent {
     pub fn log(&self, seq: u64, source: &str, event: &str, change: &str) {
         let line = format!("{} {seq} {source} {event} {change}", util::now_stamp());
         if let Err(e) = util::append_line(&self.dir.join("events.log"), &line) {
-            crate::error::warn(format!("cannot write events.log of {}: {e}", self.name()));
+            crate::error::warn(format!("cannot write events.log of {}: {e}", self.label()));
         }
     }
 
@@ -357,7 +376,7 @@ fn human_expired(h: &HoldFile, st: &StateFile, human_hold: f64) -> bool {
 pub fn create(home: &Home, info: &AgentFile, driver_files: &[(String, Vec<u8>)]) -> Result<Agent> {
     let staging = home
         .creating()
-        .join(format!("{}.{}", info.name, info.instance));
+        .join(format!("{}.{}.{}", info.project, info.name, info.instance));
     fs::create_dir_all(staging.join("holds"))?;
     fs::create_dir_all(staging.join("driver"))?;
     let r = (|| -> Result<()> {
@@ -372,14 +391,20 @@ pub fn create(home: &Home, info: &AgentFile, driver_files: &[(String, Vec<u8>)])
         let _ = fs::remove_dir_all(&staging);
         return Err(e);
     }
-    let dest = home.agent_dir(&info.name);
+    let key = AgentRef {
+        project: info.project.clone(),
+        name: info.name.clone(),
+    };
+    let dest = home.agent_dir(&key);
+    // Project directories are never removed, so a concurrent spawn in the
+    // same project cannot lose its parent directory.
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
     if let Err(e) = util::rename_noreplace(&staging, &dest) {
         let _ = fs::remove_dir_all(&staging);
         if util::is_exists(&e) {
-            return Err(Error::runtime(format!(
-                "agent already exists: {}",
-                info.name
-            )));
+            return Err(Error::runtime(format!("agent already exists: {key}")));
         }
         return Err(Error::runtime(format!(
             "cannot create {}: {e}",
@@ -396,10 +421,12 @@ pub fn create(home: &Home, info: &AgentFile, driver_files: &[(String, Vec<u8>)])
 /// Remove a record by moving it to `.removing/` first (§4.3).
 pub fn remove(agent: &Agent) -> Result<()> {
     fs::create_dir_all(agent.home.removing())?;
-    let staging = agent
-        .home
-        .removing()
-        .join(format!("{}.{}", agent.name(), agent.instance()));
+    let staging = agent.home.removing().join(format!(
+        "{}.{}.{}",
+        agent.project(),
+        agent.name(),
+        agent.instance()
+    ));
     match fs::rename(&agent.dir, &staging) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -414,10 +441,9 @@ pub fn remove(agent: &Agent) -> Result<()> {
         .map_err(|e| Error::runtime(format!("cannot remove {}: {e}", staging.display())))
 }
 
-/// Names of all records, sorted.
-pub fn list_names(home: &Home) -> Result<Vec<String>> {
+fn valid_entries(dir: &Path) -> Result<Vec<String>> {
     let mut out = Vec::new();
-    let entries = match fs::read_dir(home.agents()) {
+    let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
         Err(e) => return Err(e.into()),
@@ -429,5 +455,23 @@ pub fn list_names(home: &Home) -> Result<Vec<String>> {
         }
     }
     out.sort();
+    Ok(out)
+}
+
+/// Agents of one project, or of all projects, sorted.
+pub fn list(home: &Home, project: Option<&str>) -> Result<Vec<AgentRef>> {
+    let projects = match project {
+        Some(p) => vec![p.to_string()],
+        None => valid_entries(&home.agents())?,
+    };
+    let mut out = Vec::new();
+    for p in projects {
+        for name in valid_entries(&home.agents().join(&p))? {
+            out.push(AgentRef {
+                project: p.clone(),
+                name,
+            });
+        }
+    }
     Ok(out)
 }

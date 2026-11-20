@@ -16,6 +16,9 @@ pub struct Env {
     pub socket: String,
 }
 
+/// The project of the tests' working directory ("work dir").
+pub const PROJECT: &str = "work-dir";
+
 pub fn fake_cli() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_cli.py")
 }
@@ -52,7 +55,7 @@ impl Env {
         std::fs::write(
             home.join("config.yml"),
             format!(
-                "tmux:\n  socket_name: {socket}\n  session: t\nspawn:\n  timeout: 20\nsend:\n  settle_sec: 0.3\n  confirm_timeout: 3\nhold:\n  human_sec: 2\nkill:\n  timeout: 5\ndrivers:\n  claude:\n    submit_delay_ms: 100\n  codex:\n    submit_delay_ms: 100\n{extra}"
+                "tmux:\n  socket_name: {socket}\nspawn:\n  timeout: 20\nsend:\n  settle_sec: 0.3\n  confirm_timeout: 3\nhold:\n  human_sec: 2\nkill:\n  timeout: 5\ndrivers:\n  claude:\n    submit_delay_ms: 100\n  codex:\n    submit_delay_ms: 100\n{extra}"
             ),
         )
         .unwrap();
@@ -76,6 +79,7 @@ impl Env {
             .env("CODEX_HOME", self.tmp.path().join("codex"))
             .env_remove("TMUX")
             .env_remove("TMAC_AGENT")
+            .env_remove("TMAC_PROJECT")
             .env_remove("TMAC_INSTANCE")
             .env_remove("TMAC_CONFIG")
             .current_dir(&self.work)
@@ -152,7 +156,42 @@ impl Env {
     }
 
     pub fn agent_dir(&self, name: &str) -> PathBuf {
-        self.home.join("agents").join(name)
+        self.home.join("agents").join(PROJECT).join(name)
+    }
+
+    /// tmux target of an agent's window (the session is the project).
+    pub fn target(&self, name: &str) -> String {
+        format!("={PROJECT}:={name}")
+    }
+
+    /// A git repository with one commit under the temporary directory.
+    pub fn git_repo(&self, dir: &str) -> PathBuf {
+        let repo = self.tmp.path().join(dir);
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "i",
+            ],
+        ] {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        }
+        repo
     }
 
     /// Wait until `f` holds (up to 20 s).

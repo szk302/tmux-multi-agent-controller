@@ -14,14 +14,19 @@ fn state(env: &Env, name: &str) -> String {
 fn spawn_send_status_and_kill() {
     let env = Env::new();
     let out = env.spawn("a1", "claude", &[], &[]);
-    assert!(out.starts_with("a1 %"), "{out}");
+    assert!(out.starts_with("work-dir/a1 %"), "{out}");
     let st = env.status("a1");
     assert_eq!(st["state"], "idle");
     assert_eq!(st["driver"], "claude");
-    assert_eq!(st["tmux"]["session"], "t");
+    assert_eq!(st["tmux"]["session"], "work-dir");
+    assert_eq!(st["project"], "work-dir");
     assert!(st["pid"].as_u64().is_some());
-    assert!(env.ok(&["list"]).lines().any(|l| l.starts_with("a1 ")));
-    assert_eq!(env.ok(&["list", "-q"]), "a1\n");
+    assert!(
+        env.ok(&["list"])
+            .lines()
+            .any(|l| l.starts_with("work-dir/a1 "))
+    );
+    assert_eq!(env.ok(&["list", "-q"]), "work-dir/a1\n");
 
     // Multi-line Japanese text arrives as one prompt.
     env.ok(&["send", "a1", "こんにちは\n二行目\tタブ"]);
@@ -42,7 +47,14 @@ fn spawn_send_status_and_kill() {
     });
 
     // The pane shows its state through pane options.
-    let opt = env.tmux(&["show-options", "-p", "-t", "=t:=a1", "-v", "@tmac_state"]);
+    let opt = env.tmux(&[
+        "show-options",
+        "-p",
+        "-t",
+        "=work-dir:=a1",
+        "-v",
+        "@tmac_state",
+    ]);
     assert!(!String::from_utf8_lossy(&opt.stdout).trim().is_empty());
 
     env.ok(&["kill", "a1"]);
@@ -61,8 +73,8 @@ fn human_input_holds_tmac_input() {
     let env = Env::new();
     env.spawn("h1", "claude", &[], &[]);
     // A person types directly in the pane.
-    env.tmux(&["send-keys", "-t", "=t:=h1", "-l", "typed by hand"]);
-    env.tmux(&["send-keys", "-t", "=t:=h1", "Enter"]);
+    env.tmux(&["send-keys", "-t", "=work-dir:=h1", "-l", "typed by hand"]);
+    env.tmux(&["send-keys", "-t", "=work-dir:=h1", "Enter"]);
     env.until("the human prompt", || {
         env.prompts("h1").contains(&"typed by hand".to_string())
     });
@@ -137,7 +149,7 @@ fn waiting_state_blocks_input() {
     env.ok(&["wait", "p1", "--state", "waiting", "--timeout", "10"]);
     env.expect(&["send", "p1", "--no-wait", "x"], 5);
     env.expect(&["wait", "p1", "--timeout", "1"], 3);
-    env.tmux(&["send-keys", "-t", "=t:=p1", "y"]);
+    env.tmux(&["send-keys", "-t", "=work-dir:=p1", "y"]);
     env.ok(&["wait", "p1", "--timeout", "10"]);
     env.ok(&["kill", "p1"]);
 }
@@ -219,7 +231,7 @@ fn exited_agents_and_stale_hooks() {
     let fake = common::fake_as(&env, "claude");
     let out = env.tmac(&["spawn", "e1", "--", fake.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("tmac kill e1"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("tmac kill work-dir/e1"));
     env.ok(&["kill", "e1"]);
 
     env.spawn("e1", "claude", &[], &[]);
@@ -228,6 +240,8 @@ fn exited_agents_and_stale_hooks() {
     let before = std::fs::read_to_string(env.agent_dir("e1").join("state.yml")).unwrap();
     let mut hook = env.cmd(&[
         "hook",
+        "--project",
+        "work-dir",
         "--agent",
         "e1",
         "--instance",
@@ -237,7 +251,7 @@ fn exited_agents_and_stale_hooks() {
     ]);
     let out = hook.output().unwrap();
     assert_eq!(out.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("earlier e1"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("earlier work-dir/e1"));
     let after = std::fs::read_to_string(env.agent_dir("e1").join("state.yml")).unwrap();
     assert_eq!(before, after);
     env.ok(&["kill", "e1"]);
@@ -257,7 +271,7 @@ fn codex_driver() {
     // Esc fires Interrupt, which makes the agent idle again.
     env.ok(&["send", "c1", "busy 30"]);
     assert_eq!(state(&env, "c1"), "busy");
-    env.tmux(&["send-keys", "-t", "=t:=c1", "Escape"]);
+    env.tmux(&["send-keys", "-t", "=work-dir:=c1", "Escape"]);
     env.ok(&["wait", "c1", "--timeout", "10"]);
     env.until("the Interrupt hook", || {
         env.events("c1").iter().any(|e| e["event"] == "Interrupt")
@@ -333,4 +347,65 @@ fn usage_errors() {
     env.expect(&["hook"], 1);
     // Without an agent in the environment, a hook does nothing.
     env.expect(&["hook", "claude", "Stop"], 0);
+}
+
+#[test]
+fn projects_keep_agents_apart() {
+    let env = Env::new();
+    // Two repositories run an agent named "coder"; one runs in a worktree.
+    let a = env.git_repo("Repo-A");
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&a)
+        .args(["worktree", "add", "-q", ".worktree/feat", "-b", "feat"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let wt = a.join(".worktree/feat");
+    let b = env.git_repo("repo.b");
+    let out = env.spawn("coder", "claude", &["-C", wt.to_str().unwrap()], &[]);
+    assert!(out.starts_with("repo-a/coder %"), "{out}");
+    env.spawn("coder", "claude", &["-C", b.to_str().unwrap()], &[]);
+
+    // Elsewhere, agents are named with their project.
+    assert_eq!(
+        env.field("repo-a/coder", "cwd"),
+        wt.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(env.field("repo.b/coder", "tmux.session"), "repo-b");
+    env.expect(&["status", "coder"], 4);
+    assert_eq!(env.ok(&["list", "-q"]), "");
+    assert_eq!(
+        env.ok(&["list", "-a", "-q"]),
+        "repo-a/coder\nrepo.b/coder\n"
+    );
+
+    // Inside a repository (or one of its worktrees) the short name is enough.
+    let status_in = |dir: &std::path::Path| {
+        let out = env
+            .cmd(&["status", "coder", "--field", "project"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(status_in(&a), "repo-a");
+    assert_eq!(status_in(&wt), "repo-a");
+    assert_eq!(status_in(&b), "repo.b");
+    let out = env.cmd(&["list", "-q"]).current_dir(&b).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "repo.b/coder\n");
+
+    // -p and TMAC_PROJECT choose the project explicitly.
+    env.ok(&["-p", "repo.b", "send", "coder", "via -p"]);
+    let out = env
+        .cmd(&["send", "coder", "via env"])
+        .env("TMAC_PROJECT", "repo-a")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    env.expect(&["-p", "Bad", "status", "coder"], 2);
+
+    env.ok(&["kill", "repo-a/coder"]);
+    env.ok(&["-p", "repo.b", "kill", "coder"]);
+    assert_eq!(env.ok(&["list", "-a", "-q"]), "");
 }
