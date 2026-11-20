@@ -12,6 +12,32 @@
 
 ## インストール
 
+### ビルド済みのバイナリ
+
+[Releases](https://github.com/szk302/tmux-multi-agent-controller/releases) から、環境に合ったファイルをダウンロードして展開し、`tmac` を `PATH` の通った場所に置きます。
+
+| ファイル名の末尾 | 環境 |
+| :--- | :--- |
+| `x86_64-unknown-linux-musl.tar.gz` | Linux（x86_64、静的リンク） |
+| `aarch64-unknown-linux-musl.tar.gz` | Linux（arm64、静的リンク） |
+| `aarch64-apple-darwin.tar.gz` | macOS（Apple Silicon） |
+| `x86_64-apple-darwin.tar.gz` | macOS（Intel） |
+
+```bash
+v=v0.1.0; t=aarch64-unknown-linux-musl
+curl -LO "https://github.com/szk302/tmux-multi-agent-controller/releases/download/$v/tmac-$v-$t.tar.gz"
+curl -LO "https://github.com/szk302/tmux-multi-agent-controller/releases/download/$v/SHA256SUMS"
+grep "tmac-$v-$t.tar.gz" SHA256SUMS | sha256sum -c -   # macOS では shasum -a 256 -c -
+tar xzf "tmac-$v-$t.tar.gz"
+mkdir -p ~/.local/bin
+install "tmac-$v-$t/tmac" ~/.local/bin/
+```
+
+アーカイブには、`LICENSE` と、同梱しているサードパーティーのライセンス表示（`THIRD-PARTY-LICENSES.txt`、Linux 版は `MUSL-COPYRIGHT` も）が入っています。
+Codex のフックの信頼は、tmac の実行ファイルの場所ごとに記録されます（§5.5.1）。置き場所を変えたら、Codex の画面で 1 回だけ信頼し直してください。
+
+### ソースから
+
 Rust ツールチェーンは [mise](https://mise.jdx.dev/) で管理しています。
 
 ```bash
@@ -122,6 +148,24 @@ mise run lint
 ```
 
 結合テスト（`tests/agents.rs`）は、テストごとに専用の tmux サーバーとデータディレクトリを作り、フックを本物と同じように呼ぶ偽の CLI（`tests/fake_cli.py`）を起動します。
+
+### リリース
+
+1. `Cargo.toml` の `version` を上げ、`cargo build` で `Cargo.lock` も更新して、両方をコミットする（`Cargo.lock` が古いと `--locked` のビルドが失敗します）。
+2. プルリクエストをマージした後、`main` のそのコミットに同じバージョンのタグを付けて push する。
+
+```bash
+git switch main && git pull --ff-only
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` が、4 つのターゲットでテストとビルドを行い、GitHub Release にアーカイブと `SHA256SUMS` を添付します。
+
+- タグが `Cargo.toml` のバージョンと一致しない場合や、タグのコミットが `main` に含まれない場合は、何も公開せずに失敗します。
+- `-` を含むタグ（例: `v0.2.0-rc.1`）は、プレリリースとして公開します。
+- Actions の画面から手動で実行（`workflow_dispatch`）すると、ビルドとテストだけを行い、公開はしません。リリースの前の確認に使えます。
+- 同梱するライセンス表示は [cargo-about](https://github.com/EmbarkStudios/cargo-about) で作ります（`about.toml`・`about.hbs`）。
 
 ## ライセンス
 
