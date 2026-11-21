@@ -24,6 +24,8 @@ pub struct SpawnArgs {
     pub pass_env: Vec<String>,
     pub relay: Vec<String>,
     pub session: Option<String>,
+    /// Fail instead of creating the session (§5.2).
+    pub no_create_session: bool,
     pub human_hold: Option<f64>,
     pub allow_foreign_hooks: bool,
     /// Instead of the driver's first prompt.
@@ -114,14 +116,16 @@ pub fn run(a: SpawnArgs) -> Result<()> {
             )));
         }
     }
-    let session = a
-        .session
-        .clone()
-        .or_else(|| cfg.tmux_session.clone())
-        .unwrap_or_else(|| project::session_name(&key.project));
-    if session.is_empty() || session.contains([':', '.']) {
-        return Err(Error::usage(format!(
-            "invalid tmux session name {session:?}"
+    let session = match &a.session {
+        Some(s) => project::check_session(s)?,
+        None => project::session_for(&cfg, &key.project)?,
+    };
+    let tmux = Tmux::with_socket_name(cfg.tmux_socket_name.as_deref());
+    let session_exists = tmux.has_session(&session)?;
+    if a.no_create_session && !session_exists {
+        return Err(Error::runtime(format!(
+            "the tmux session {session:?} does not exist; create it from your terminal with \
+             `tmac session --create` (agents get the environment of the session)"
         )));
     }
     let human_hold = a.human_hold.unwrap_or(cfg.hold_human_sec);
@@ -138,7 +142,22 @@ pub fn run(a: SpawnArgs) -> Result<()> {
     {
         command.push(p.to_string());
     }
-    check_hooks(&driver, &cwd, &command, &relay, &cfg, a.allow_foreign_hooks)?;
+    // Look for the hooks where the agent will: with the environment of the
+    // session it starts in, not the caller's (§5.6).
+    let lookup = agent_lookup(
+        &tmux,
+        session_exists.then_some(session.as_str()),
+        &env_pairs,
+    )?;
+    check_hooks(
+        &driver,
+        &lookup,
+        &cwd,
+        &command,
+        &relay,
+        &cfg,
+        a.allow_foreign_hooks,
+    )?;
     // Remove the variables CLIs set for their own sessions (§5.4): every
     // driver's, since the parent CLI may be of any kind.
     let mut unset: Vec<String> = Vec::new();
@@ -209,8 +228,15 @@ pub fn run(a: SpawnArgs) -> Result<()> {
     };
     let mut agent = record::create(&home, &info)?;
 
-    let tmux = Tmux::with_socket_name(cfg.tmux_socket_name.as_deref());
-    let (pane, socket) = match create_pane(&tmux, &agent.info, &cwd, &env_all, &pane_command) {
+    let created = create_pane(
+        &tmux,
+        &agent.info,
+        &cwd,
+        &env_all,
+        &pane_command,
+        !a.no_create_session,
+    );
+    let (pane, socket) = match created {
         Ok(v) => v,
         Err(e) => {
             let _ = record::remove(&agent);
@@ -251,18 +277,32 @@ pub fn run(a: SpawnArgs) -> Result<()> {
     }
 }
 
+/// The environment the agent will get, to find the CLI's settings (§5.6):
+/// the tmux server's global environment with the session's on top (or this
+/// process's, if no server runs: spawn starts one with it), and the
+/// variables spawn adds.
+fn agent_lookup(tmux: &Tmux, session: Option<&str>, added: &[(String, String)]) -> Result<Lookup> {
+    let mut vars = match tmux.environment(session)? {
+        Some(env) => env,
+        None => std::env::vars().collect(),
+    };
+    vars.extend(added.iter().cloned());
+    Ok(Lookup::from_map(vars))
+}
+
 /// Check the hooks the CLI will run before starting it (§5.6): tmac's hook
 /// once for every event, `tmac` in PATH, time limits long enough for the
 /// relays, and no other hooks that can block.
 fn check_hooks(
     driver: &Driver,
+    lookup: &Lookup,
     cwd: &std::path::Path,
     command: &[String],
     relay: &BTreeMap<String, String>,
     cfg: &config::Config,
     allow_foreign: bool,
 ) -> Result<()> {
-    let c = Check::run(driver, &Lookup::from_env(), cwd, command)?;
+    let c = Check::run(driver, lookup, cwd, command)?;
     let missing = c.missing();
     if !missing.is_empty() {
         return Err(Error::usage(format!(
@@ -330,13 +370,20 @@ fn create_pane(
     cwd: &std::path::Path,
     env: &[(String, String)],
     command: &[String],
+    may_create_session: bool,
 ) -> Result<(String, String)> {
     let session = &info.tmux.session;
     let instance = &info.instance;
     let target = format!("={session}:={instance}");
     let mut last_err = None;
     for _ in 0..3 {
-        let mut args: Vec<String> = if tmux.has_session(session)? {
+        let exists = tmux.has_session(session)?;
+        if !exists && !may_create_session {
+            return Err(Error::runtime(format!(
+                "the tmux session {session:?} is gone"
+            )));
+        }
+        let mut args: Vec<String> = if exists {
             vec![
                 "new-window".into(),
                 "-d".into(),

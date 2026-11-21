@@ -70,6 +70,15 @@ impl Lookup {
         }
     }
 
+    /// These variables (the environment the agent will get, §5.6) and the
+    /// system-wide files.
+    pub fn from_map(vars: BTreeMap<String, String>) -> Lookup {
+        Lookup {
+            vars: Some(vars),
+            system: true,
+        }
+    }
+
     /// Fixed variables and no system-wide files (for tests).
     pub fn with_vars(vars: &[(&str, &str)]) -> Lookup {
         Lookup {

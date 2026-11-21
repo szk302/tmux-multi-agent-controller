@@ -9,7 +9,9 @@ use crate::config::Config;
 use crate::driver::Driver;
 use crate::error::{Error, Result};
 use crate::home::LockKind;
-use crate::record::{Agent, HoldFile, InputFile, Progress, State, StateFile, UNCONFIRMED};
+use crate::record::{
+    Agent, HoldFile, InputFile, PRESENCE, Progress, State, StateFile, UNCONFIRMED,
+};
 use crate::tmux::{PaneInfo, Tmux};
 use crate::util;
 
@@ -55,12 +57,36 @@ pub fn reconcile(agent: &Agent) -> Result<(StateFile, Option<PaneInfo>)> {
     Ok((st, pane))
 }
 
-/// Whether tmac may type now: `idle` for at least `send.settle_sec`, and no
-/// hold in effect (§1.4).
+/// Whether tmac may type now: `idle` for at least `send.settle_sec`, no
+/// hold in effect and nobody typing at a terminal that shows the agent
+/// (§1.4, §9.4).
 pub fn can_input(agent: &Agent, cfg: &Config, st: &StateFile) -> Result<bool> {
-    Ok(st.state == State::Idle
-        && util::elapsed_secs(&st.since) >= cfg.send_settle_sec
-        && agent.active_holds(st)?.is_empty())
+    if st.state != State::Idle || util::elapsed_secs(&st.since) < cfg.send_settle_sec {
+        return Ok(false);
+    }
+    Ok(holds_now(agent, cfg, st)?.is_empty())
+}
+
+/// Whether a terminal that shows the agent's window had a key press within
+/// `hold.presence_sec` (§9.4).
+pub fn present(agent: &Agent, cfg: &Config) -> Result<bool> {
+    if cfg.hold_presence_sec <= 0.0 {
+        return Ok(false);
+    }
+    let Some(pane) = agent.info.tmux.pane.as_deref() else {
+        return Ok(false);
+    };
+    let idle = Tmux::for_agent(&agent.info.tmux).presence(pane)?;
+    Ok(idle.is_some_and(|s| s < cfg.hold_presence_sec))
+}
+
+/// Holds in effect now, with `presence` (§9.2, §9.4).
+pub fn holds_now(agent: &Agent, cfg: &Config, st: &StateFile) -> Result<Vec<String>> {
+    let mut holds = agent.active_holds(st)?;
+    if present(agent, cfg)? {
+        holds.push(PRESENCE.into());
+    }
+    Ok(holds)
 }
 
 /// Update the display options of the pane (§4.4). Errors are ignored.

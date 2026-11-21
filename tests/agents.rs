@@ -509,9 +509,17 @@ fn spawn_needs_tmacs_hooks_once() {
 fn spawn_needs_tmac_in_path() {
     let env = Env::new();
     let fake = common::fake_as(&env, "claude");
+    // tmux is there (spawn asks it for the session's environment), tmac not.
+    let only_tmux = env.tmp.path().join("only-tmux");
+    std::fs::create_dir_all(&only_tmux).unwrap();
+    let tmux = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|d| d.join("tmux"))
+        .find(|p| p.is_file())
+        .unwrap();
+    std::os::unix::fs::symlink(tmux, only_tmux.join("tmux")).unwrap();
     let out = env
         .cmd(&["spawn", "n2", "--", fake.to_str().unwrap()])
-        .env("PATH", env.tmp.path().join("nowhere"))
+        .env("PATH", &only_tmux)
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));

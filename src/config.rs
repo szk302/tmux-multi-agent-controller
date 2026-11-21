@@ -23,6 +23,9 @@ pub struct Config {
     pub send_max_bytes: usize,
     pub kill_timeout: f64,
     pub hold_human_sec: f64,
+    /// Seconds after a key press of a terminal that shows an agent during
+    /// which tmac does not type into it (§9.4). 0: never.
+    pub hold_presence_sec: f64,
     pub relay_timeout: f64,
     /// driver -> event -> command
     pub relay: BTreeMap<String, BTreeMap<String, String>>,
@@ -40,6 +43,7 @@ impl Default for Config {
             send_max_bytes: 65536,
             kill_timeout: 30.0,
             hold_human_sec: 300.0,
+            hold_presence_sec: 300.0,
             relay_timeout: 20.0,
             relay: BTreeMap::new(),
         }
@@ -191,6 +195,7 @@ pub fn parse(text: &str) -> std::result::Result<Config, String> {
                 for (k2, v2) in mapping(v, "hold")? {
                     match k2.as_str().unwrap_or_default() {
                         "human_sec" => cfg.hold_human_sec = number(v2, "hold.human_sec")?,
+                        "presence_sec" => cfg.hold_presence_sec = number(v2, "hold.presence_sec")?,
                         other => warn(format!("unknown config key: hold.{other}")),
                     }
                 }

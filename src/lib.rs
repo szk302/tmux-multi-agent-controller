@@ -17,7 +17,7 @@ pub mod util;
 use clap::Parser;
 
 use crate::cli::{Cli, Cmd, DriverCmd, HooksCmd};
-use crate::commands::{drivers, hook, hooks, input, manage, spawn};
+use crate::commands::{drivers, hook, hooks, input, manage, session, spawn};
 
 /// Run the command line and return the exit code.
 pub fn run() -> i32 {
@@ -61,6 +61,7 @@ pub fn run() -> i32 {
             pass_env: s.pass_env,
             relay: s.relay,
             session: s.session,
+            no_create_session: s.no_create_session,
             human_hold: s.human_hold,
             allow_foreign_hooks: s.allow_foreign_hooks,
             first_prompt: s.first_prompt,
@@ -89,6 +90,9 @@ pub fn run() -> i32 {
             target(&r.name).and_then(|a| manage::release(&a, r.key.as_deref(), r.all))
         }
         Cmd::Status(s) => target(&s.name).and_then(|r| manage::status(&r, s.field.as_deref())),
+        Cmd::Attach(a) => target(&a.name).and_then(|r| session::attach(&r)),
+        Cmd::Session(s) => session::session(pr, s.create),
+        Cmd::Project(p) => session::project(pr, p.cwd.as_deref()),
         Cmd::List(l) => {
             if l.all {
                 manage::list(l.quiet, None)
