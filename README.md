@@ -84,9 +84,10 @@ tmac doctor            # claude と codex の両方（tmac doctor codex で片�
 ## 使い方
 
 ```bash
+tmac session --create                       # 端末で、エージェントを起動する tmux のセッションを用意する
 # 起動して、入力を受け付けられるようになるまで待つ（"repo/impl-001 %3" のように出力）
-tmac spawn impl-001 --cwd ~/work/repo/.worktree/feat/x --pass-env PATH -- claude
-tmux attach -t repo                         # ペインを見る（セッションはプロジェクト、ウィンドウはエージェント名）
+tmac spawn impl-001 --cwd ~/work/repo/.worktree/feat/x --no-create-session -- claude
+tmac attach impl-001                        # エージェントのペインを見る（tmux の中なら切り替える）
 
 tmac send impl-001 "README の誤字を直してください"   # 入力できるまで待って入力する
 tmac wait impl-001                          # idle になるまで待つ
@@ -98,6 +99,9 @@ tmac release impl-001
 tmac kill impl-001                          # 終了して、ペインと記録を削除する
 ```
 
+- **人が打っている間は入力しません。** エージェントのウィンドウを表示している端末で、最後にキーを押してから `hold.presence_sec`（既定 300 秒）の間は、`send`・`wake` が待ちます（`status` の保留に `presence` と出ます）。打ちかけの文と一緒に送信されないようにするためです。人が送信した入力も、`hold.human_sec` の間は保留になります。
+- **エージェントの環境変数は、tmux のセッションの環境です。** Dagu のステップのように環境変数を絞られたプロセスから `spawn` するときは、先に利用者の端末で `tmac session --create` を実行し、`spawn --no-create-session` を使ってください。`spawn` は、フックが入っているかも、このセッションの環境（`CLAUDE_CONFIG_DIR` など）で調べます。
+
 ### プロジェクト
 
 エージェントは「プロジェクト/名前」で識別します。プロジェクトは docker compose と同じく、次の順で決まります。
@@ -108,6 +112,7 @@ tmac kill impl-001                          # 終了して、ペインと記録�
 
 ```bash
 cd ~/work/repo && tmac send impl-001 "..."   # リポジトリの中なら短い名前で指せる
+tmac project -C ~/work/repo/.worktree/feat/x   # ディレクトリのプロジェクト名（ほかの道具で同じ名前を使うとき）
 tmac status repo/impl-001                      # どこからでも「プロジェクト/名前」で指せる
 tmac -p repo kill impl-001
 tmac list -a                                   # すべてのプロジェクト
@@ -163,6 +168,7 @@ send:
   settle_sec: 10         # idle がこの秒数続いたら入力する
 hold:
   human_sec: 300         # 人の入力を検出した後に止める秒数
+  presence_sec: 300      # エージェントを表示している端末で、最後のキー入力から入力しない秒数（0 で無効）
 spawn:
   allow_foreign_hooks:   # 停止を止めないと分かっている、ほかのフック（spawn が示す場所の先頭）
     - plugin codex@openai-codex
@@ -178,7 +184,7 @@ relay:
 | コード | 意味 |
 | :--- | :--- |
 | 0 | 成功 |
-| 1 | 実行時エラー |
+| 1 | 実行時エラー（`spawn --no-create-session` でセッションがない場合を含む） |
 | 2 | 使い方・設定の誤り（`spawn` で、tmac のフックが足りない・重なっている、`PATH` に tmac がない、tmac 以外のフックが見つかった場合を含む） |
 | 3 | 時間切れ |
 | 4 | エージェントがない（終了した、別の起動に置き換わった場合を含む） |

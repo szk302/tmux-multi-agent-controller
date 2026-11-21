@@ -11,7 +11,7 @@ use crate::error::{Error, Result, warn};
 use crate::home::{Home, LockKind};
 use crate::ops;
 use crate::project::AgentRef;
-use crate::record::{self, Agent, HUMAN, HoldFile, State, UNCONFIRMED};
+use crate::record::{self, Agent, HUMAN, HoldFile, PRESENCE, State, UNCONFIRMED};
 use crate::tmux::Tmux;
 use crate::util;
 
@@ -72,7 +72,7 @@ pub fn hold(
     if !util::valid_name(key) {
         return Err(Error::usage(format!("invalid hold key {key:?}")));
     }
-    if key == HUMAN || key == UNCONFIRMED {
+    if key == HUMAN || key == UNCONFIRMED || key == PRESENCE {
         return Err(Error::usage(format!("the hold key {key:?} is reserved")));
     }
     let home = Home::resolve()?;
@@ -158,7 +158,7 @@ struct StatusOut {
     created_at: String,
 }
 
-fn status_of(agent: &Agent) -> Result<StatusOut> {
+fn status_of(agent: &Agent, cfg: &config::Config) -> Result<StatusOut> {
     let (st, pane) = ops::reconcile(agent)?;
     Ok(StatusOut {
         project: agent.project().into(),
@@ -167,7 +167,7 @@ fn status_of(agent: &Agent) -> Result<StatusOut> {
         driver: agent.info.driver.clone(),
         state: st.state.as_str().into(),
         since: st.since.clone(),
-        holds: agent.active_holds(&st)?,
+        holds: ops::holds_now(agent, cfg, &st)?,
         cwd: agent.info.cwd.clone(),
         tmux: TmuxOut {
             session: agent.info.tmux.session.clone(),
@@ -186,8 +186,9 @@ fn status_of(agent: &Agent) -> Result<StatusOut> {
 
 pub fn status(agent_ref: &AgentRef, field: Option<&str>) -> Result<()> {
     let home = Home::resolve()?;
+    let cfg = config::load(&home)?;
     let agent = Agent::require(&home, agent_ref)?;
-    let out = status_of(&agent)?;
+    let out = status_of(&agent, &cfg)?;
     let value = serde_json::to_value(&out).map_err(|e| Error::runtime(e.to_string()))?;
     match field {
         None => {
@@ -221,6 +222,7 @@ fn age(stamp: &str) -> String {
 /// `project`: `None` lists every project (`-a`).
 pub fn list(quiet: bool, project: Option<&str>) -> Result<()> {
     let home = Home::resolve()?;
+    let cfg = config::load(&home)?;
     let mut rows = Vec::new();
     for agent_ref in record::list(&home, project)? {
         if quiet {
@@ -235,7 +237,7 @@ pub fn list(quiet: bool, project: Option<&str>) -> Result<()> {
                 continue;
             }
         };
-        match status_of(&agent) {
+        match status_of(&agent, &cfg) {
             Ok(s) => rows.push([
                 format!("{}/{}", s.project, s.name),
                 s.driver,
@@ -294,7 +296,12 @@ pub fn kill(agent_ref: &AgentRef, timeout: Option<f64>, force: bool) -> Result<(
         let _g = home.state_lock(agent_ref)?;
         let st = agent.state()?;
         agent.expire_holds(&st)?;
-        let holds = agent.active_holds(&st)?;
+        let mut holds = agent.active_holds(&st)?;
+        // Ending a live CLI types /exit (or signals it) under the person's
+        // eyes; an exited one only loses its pane (§11, §9.4).
+        if st.state != State::Exited && ops::present(&agent, &cfg)? {
+            holds.push(PRESENCE.into());
+        }
         if !holds.is_empty() && !force {
             return Err(Error::NotReady(format!(
                 "{name} is held ({}); release it or use --force",

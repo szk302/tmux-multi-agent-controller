@@ -1,6 +1,7 @@
 //! tmux operations. Every operation on a pane checks its tag
 //! (`@tmac_instance`) in the same tmux invocation (§3.5, §7.3, §11).
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -232,6 +233,113 @@ impl Tmux {
         self.if_tagged(pane, instance, &cmd)
     }
 
+    /// Seconds since the last key press of a terminal (tmux client) that
+    /// shows the window of `pane` (§9.4). tmux updates `client_activity`
+    /// when a terminal attaches and when a person presses a key, not for
+    /// `send-keys` or `paste-buffer`. `None`: no terminal shows the window,
+    /// or the pane or the server is gone.
+    pub fn presence(&self, pane: &str) -> Result<Option<f64>> {
+        let args: Vec<String> = [
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            "#{window_id}",
+            ";",
+            "list-clients",
+            "-F",
+            "#{window_id}\t#{client_activity}",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (ok, out, err) = self.try_run(&args)?;
+        if !ok {
+            if no_server(&err)
+                || err.contains("can't find pane")
+                || err.contains("can't find window")
+            {
+                return Ok(None);
+            }
+            return Err(Error::runtime(format!(
+                "tmux list-clients failed: {}",
+                err.trim()
+            )));
+        }
+        let mut lines = out.lines();
+        let window = lines.next().unwrap_or("").trim().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let latest = lines
+            .filter_map(|l| l.split_once('\t'))
+            .filter(|(w, _)| *w == window)
+            .filter_map(|(_, at)| at.trim().parse::<f64>().ok())
+            .fold(None, |m: Option<f64>, at| Some(m.map_or(at, |m| m.max(at))));
+        Ok(latest.map(|at| (now - at).max(0.0)))
+    }
+
+    /// The environment new windows get (§5.6): the server's global
+    /// environment, with that of `session` (if given) on top. `None` if no
+    /// server runs.
+    pub fn environment(&self, session: Option<&str>) -> Result<Option<BTreeMap<String, String>>> {
+        let (ok, out, err) = self.try_run(&["show-environment".into(), "-g".into()])?;
+        if !ok {
+            if no_server(&err) {
+                return Ok(None);
+            }
+            return Err(Error::runtime(format!(
+                "tmux show-environment failed: {}",
+                err.trim()
+            )));
+        }
+        let mut env = BTreeMap::new();
+        apply_environment(&mut env, &out);
+        if let Some(s) = session {
+            let out = self.run(&["show-environment".into(), "-t".into(), format!("={s}")])?;
+            apply_environment(&mut env, &out);
+        }
+        Ok(Some(env))
+    }
+
+    /// Session and socket path of a pane.
+    pub fn pane_session(&self, pane: &str) -> Result<(String, String)> {
+        let out = self.run(&[
+            "display-message".into(),
+            "-p".into(),
+            "-t".into(),
+            pane.into(),
+            "#{session_name}\t#{socket_path}".into(),
+        ])?;
+        let line = out.lines().next().unwrap_or("");
+        let (session, socket) = line.split_once('\t').unwrap_or((line, ""));
+        Ok((session.to_string(), socket.to_string()))
+    }
+
+    /// Make the pane the current one of its window and session.
+    pub fn select(&self, pane: &str) -> Result<()> {
+        self.run(&[
+            "select-window".into(),
+            "-t".into(),
+            pane.into(),
+            ";".into(),
+            "select-pane".into(),
+            "-t".into(),
+            pane.into(),
+        ])
+        .map(|_| ())
+    }
+
+    /// Replace this process with `tmux attach-session -t =<session>`.
+    pub fn exec_attach(&self, session: &str) -> Error {
+        use std::os::unix::process::CommandExt;
+        let e = self
+            .command(&["attach-session".into(), "-t".into(), format!("={session}")])
+            .exec();
+        Error::runtime(format!("cannot run tmux: {e}"))
+    }
+
     /// Socket path of the server (`#{socket_path}`) as seen from a pane.
     pub fn socket_path(&self, pane: &str) -> Result<String> {
         Ok(self
@@ -247,9 +355,30 @@ impl Tmux {
     }
 }
 
+/// Apply the output of `show-environment` (`NAME=VALUE`, or `-NAME` for a
+/// variable removed from new windows).
+fn apply_environment(env: &mut BTreeMap<String, String>, out: &str) {
+    for line in out.lines() {
+        if let Some(name) = line.strip_prefix('-') {
+            env.remove(name);
+        } else if let Some((k, v)) = line.split_once('=') {
+            env.insert(k.to_string(), v.to_string());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_lines() {
+        let mut env = BTreeMap::new();
+        apply_environment(&mut env, "HOME=/h\nA=1\nB=x=y\n");
+        apply_environment(&mut env, "-A\nC=3\n");
+        let got: Vec<_> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        assert_eq!(got, ["B=x=y", "C=3", "HOME=/h"]);
+    }
 
     #[test]
     fn escaping() {

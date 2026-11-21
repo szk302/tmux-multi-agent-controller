@@ -37,6 +37,12 @@ pub enum Cmd {
     Release(ReleaseCli),
     /// Show an agent as YAML
     Status(StatusCli),
+    /// Show an agent's window in this terminal (attach to its tmux session)
+    Attach(AttachCli),
+    /// Print the tmux session of the project's agents (--create: make it here)
+    Session(SessionCli),
+    /// Print the project of a directory
+    Project(ProjectCli),
     /// List agents
     List(ListCli),
     /// End an agent and remove its pane and record
@@ -124,6 +130,10 @@ pub struct SpawnCli {
     /// tmux session for the new window
     #[arg(long)]
     pub session: Option<String>,
+    /// Fail if the session does not exist, instead of creating it (agents
+    /// get the environment of the session: create it from your terminal)
+    #[arg(long = "no-create-session")]
+    pub no_create_session: bool,
     /// Seconds to hold input after a person typed in the pane (0: never)
     #[arg(long = "human-hold", value_name = "SEC")]
     pub human_hold: Option<f64>,
@@ -224,6 +234,26 @@ pub struct StatusCli {
     /// Print one field only (e.g. state)
     #[arg(long)]
     pub field: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct AttachCli {
+    pub name: String,
+}
+
+#[derive(Args, Debug)]
+pub struct SessionCli {
+    /// Create the session if it does not exist, with this terminal's
+    /// environment
+    #[arg(long)]
+    pub create: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ProjectCli {
+    /// Directory to take the project from (ignores -p and $TMAC_PROJECT)
+    #[arg(short = 'C', long)]
+    pub cwd: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

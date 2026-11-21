@@ -151,6 +151,9 @@ pub struct InputFile {
 
 pub const HUMAN: &str = "human";
 pub const UNCONFIRMED: &str = "unconfirmed";
+/// Not a file: shown while a person at a terminal that shows the agent
+/// pressed a key recently (§9.4).
+pub const PRESENCE: &str = "presence";
 
 /// A loaded agent record.
 #[derive(Debug, Clone)]

@@ -136,7 +136,7 @@ impl Env {
         std::fs::write(
             home.join("config.yml"),
             format!(
-                "tmux:\n  socket_name: {socket}\nsend:\n  settle_sec: 0.3\n  confirm_timeout: 3\nhold:\n  human_sec: 2\nkill:\n  timeout: 5\n{extra}"
+                "tmux:\n  socket_name: {socket}\nsend:\n  settle_sec: 0.3\n  confirm_timeout: 3\nhold:\n  human_sec: 2\n  presence_sec: 3\nkill:\n  timeout: 5\n{extra}"
             ),
         )
         .unwrap();
@@ -155,6 +155,14 @@ impl Env {
             work,
             socket,
         }
+    }
+
+    /// Replace text in the configuration file.
+    pub fn edit_config(&self, from: &str, to: &str) {
+        let path = self.home.join("config.yml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(from), "{from:?} not in {text:?}");
+        std::fs::write(path, text.replacen(from, to, 1)).unwrap();
     }
 
     pub fn log_path(&self, name: &str) -> PathBuf {
@@ -211,6 +219,37 @@ impl Env {
         args.extend_from_slice(&["--", fake.to_str().unwrap()]);
         args.extend_from_slice(cli_args);
         self.ok(&args)
+    }
+
+    /// A person's terminal running `argv` (see tests/fake_term.py): write
+    /// lines to its stdin to press keys, drop the child to close it.
+    pub fn terminal(&self, argv: &[&str]) -> std::process::Child {
+        let c = self.cmd(&[]);
+        let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_term.py");
+        let mut all = vec![fake.to_str().unwrap()];
+        all.extend_from_slice(argv);
+        let mut t = Command::new(all[0]);
+        t.args(&all[1..]);
+        for (k, v) in c.get_envs() {
+            match v {
+                Some(v) => t.env(k, v),
+                None => t.env_remove(k),
+            };
+        }
+        t.current_dir(&self.work)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        t.spawn().unwrap()
+    }
+
+    /// `window_name` of every terminal (tmux client) of the test server.
+    pub fn clients(&self) -> Vec<String> {
+        let out = self.tmux(&["list-clients", "-F", "#{window_name}"]);
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     pub fn tmux(&self, args: &[&str]) -> Output {

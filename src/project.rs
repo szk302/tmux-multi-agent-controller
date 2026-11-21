@@ -124,6 +124,25 @@ pub fn session_name(project: &str) -> String {
     project.replace(['.', ':'], "-")
 }
 
+/// A tmux session name given by the user: tmux does not allow `.` and `:`.
+pub fn check_session(session: &str) -> Result<String> {
+    if session.is_empty() || session.contains([':', '.']) {
+        return Err(Error::usage(format!(
+            "invalid tmux session name {session:?}"
+        )));
+    }
+    Ok(session.to_string())
+}
+
+/// The session of a project's agents: `tmux.session` of the configuration,
+/// else from the project name (§5.2, §12.2).
+pub fn session_for(cfg: &crate::config::Config, project: &str) -> Result<String> {
+    match &cfg.tmux_session {
+        Some(s) => check_session(s),
+        None => Ok(session_name(project)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
