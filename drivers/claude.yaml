@@ -26,6 +26,9 @@ events:
 payload:
   session_id: session_id
   prompt: prompt
+  # In Stop: whether this stop continues one a relay stopped
+  # (TMAC_STOP_ACTIVE for relays).
+  stop_active: stop_hook_active
 
 prompt:
   # Prompts the CLI makes itself (notices of finished background tasks);
@@ -53,6 +56,31 @@ hooks:
     - {file: "/Library/Application Support/ClaudeCode/managed-settings.json", format: json, os: macos, system: true}
     - {arg: --settings, format: json}
     - {plugins: claude, dir: "${CLAUDE_CONFIG_DIR:-~/.claude}"}
+
+spawn:
+  # Variables Claude Code sets for its own session. spawn removes these
+  # (of every driver) from the agent, so that an agent started from inside
+  # a Claude Code session is not taken for a child of it. CLAUDE_CONFIG_DIR
+  # and other settings of the user are kept.
+  session_env:
+    - CLAUDECODE
+    - CLAUDE_PID
+    - CLAUDE_EFFORT
+    - CLAUDE_ENV_FILE
+    - CLAUDE_PROJECT_DIR
+    - CLAUDE_PLUGIN_ROOT
+    - CLAUDE_PLUGIN_DATA
+    - CLAUDE_CODE_ENTRYPOINT
+    - CLAUDE_CODE_EXECPATH
+    - CLAUDE_CODE_CHILD_SESSION
+    - CLAUDE_CODE_SSE_PORT
+    - CLAUDE_CODE_SESSION_*
+    - CLAUDE_CODE_MESSAGING_*
+    - CLAUDE_CODE_BRIDGE_*
+    # Set by the openai-codex plugin of Claude Code.
+    - CODEX_COMPANION_*
+  hints:
+    timeout: is it waiting for a confirmation, such as trusting the folder? Look at the pane.
 
 # How `tmac hooks rulesync` writes the hooks.
 rulesync:

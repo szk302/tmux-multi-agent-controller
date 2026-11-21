@@ -26,6 +26,9 @@ pub struct SpawnArgs {
     pub session: Option<String>,
     pub human_hold: Option<f64>,
     pub allow_foreign_hooks: bool,
+    /// Instead of the driver's first prompt.
+    pub first_prompt: Option<String>,
+    pub no_first_prompt: bool,
     pub timeout: Option<f64>,
     pub command: Vec<String>,
 }
@@ -127,14 +130,36 @@ pub fn run(a: SpawnArgs) -> Result<()> {
         return Err(Error::usage("times must not be negative"));
     }
 
-    check_hooks(
-        &driver,
-        &cwd,
-        &a.command,
-        &relay,
-        &cfg,
-        a.allow_foreign_hooks,
-    )?;
+    // The command as the CLI gets it: with the first prompt the driver
+    // needs, if any (§5.3).
+    let mut command = a.command.clone();
+    if !a.no_first_prompt
+        && let Some(p) = a.first_prompt.as_deref().or(driver.first_prompt())
+    {
+        command.push(p.to_string());
+    }
+    check_hooks(&driver, &cwd, &command, &relay, &cfg, a.allow_foreign_hooks)?;
+    // Remove the variables CLIs set for their own sessions (§5.4): every
+    // driver's, since the parent CLI may be of any kind.
+    let mut unset: Vec<String> = Vec::new();
+    for d in Driver::all(&home)? {
+        for v in d.session_env() {
+            if !unset.contains(v) {
+                unset.push(v.clone());
+            }
+        }
+    }
+    let mut pane_command = Vec::new();
+    if !unset.is_empty() {
+        pane_command.push(std::env::current_exe()?.to_string_lossy().into_owned());
+        pane_command.push("exec-clean".into());
+        for v in &unset {
+            pane_command.push("--unset".into());
+            pane_command.push(v.clone());
+        }
+        pane_command.push("--".into());
+    }
+    pane_command.extend(command.iter().cloned());
 
     if let Some(old) = Agent::load(&home, &key)? {
         let exited = ops::reconcile(&old)
@@ -171,7 +196,7 @@ pub fn run(a: SpawnArgs) -> Result<()> {
         created_at: util::now_stamp(),
         spawn_timeout: timeout,
         cwd: cwd.to_string_lossy().into_owned(),
-        command: a.command.clone(),
+        command: command.clone(),
         env_names: env_pairs.iter().map(|(k, _)| k.clone()).collect(),
         tmux: TmuxInfo {
             socket_name: cfg.tmux_socket_name.clone(),
@@ -185,7 +210,7 @@ pub fn run(a: SpawnArgs) -> Result<()> {
     let mut agent = record::create(&home, &info)?;
 
     let tmux = Tmux::with_socket_name(cfg.tmux_socket_name.as_deref());
-    let (pane, socket) = match create_pane(&tmux, &agent.info, &cwd, &env_all, &a.command) {
+    let (pane, socket) = match create_pane(&tmux, &agent.info, &cwd, &env_all, &pane_command) {
         Ok(v) => v,
         Err(e) => {
             let _ = record::remove(&agent);
@@ -214,9 +239,11 @@ pub fn run(a: SpawnArgs) -> Result<()> {
             _ => {}
         }
         if Instant::now() >= deadline {
+            let hint = driver
+                .timeout_hint()
+                .unwrap_or("look at the pane (a confirmation screen?).");
             return Err(Error::Timeout(format!(
-                "{key} is still {} after {timeout}s; look at the pane (a confirmation screen?) \
-                 or wait with `tmac wait {key}`",
+                "{key} is still {} after {timeout}s; {hint} Then wait with `tmac wait {key}`",
                 st.state.as_str()
             )));
         }

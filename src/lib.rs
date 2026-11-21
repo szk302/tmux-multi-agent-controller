@@ -63,6 +63,8 @@ pub fn run() -> i32 {
             session: s.session,
             human_hold: s.human_hold,
             allow_foreign_hooks: s.allow_foreign_hooks,
+            first_prompt: s.first_prompt,
+            no_first_prompt: s.no_first_prompt,
             timeout: s.timeout,
             command: s.command,
         }),
@@ -104,6 +106,7 @@ pub fn run() -> i32 {
             Err(e) => Err(e),
         },
         Cmd::Hooks(HooksCmd::Rulesync(r)) => hooks::rulesync(&r.dir, r.merge.as_deref(), &r.target),
+        Cmd::ExecClean(e) => return exec_clean(&e.unset, &e.command),
         Cmd::Driver(DriverCmd::List) => drivers::list(),
         Cmd::Driver(DriverCmd::Show { name }) => drivers::show(&name),
         Cmd::Driver(DriverCmd::Check { target }) => drivers::check(target.as_deref()),
@@ -115,4 +118,28 @@ pub fn run() -> i32 {
             e.code()
         }
     }
+}
+
+/// Run `command` (replacing this process) without the variables named in
+/// `unset` (names, or prefixes ending with `*`). The TMAC_* variables are
+/// kept (§5.4).
+fn exec_clean(unset: &[String], command: &[String]) -> i32 {
+    use std::os::unix::process::CommandExt;
+    let matches = |k: &str| {
+        !k.starts_with("TMAC_")
+            && unset.iter().any(|p| match p.strip_suffix('*') {
+                Some(prefix) => k.starts_with(prefix),
+                None => k == p,
+            })
+    };
+    let mut c = std::process::Command::new(&command[0]);
+    c.args(&command[1..]);
+    for (k, _) in std::env::vars_os() {
+        if matches(&k.to_string_lossy()) {
+            c.env_remove(&k);
+        }
+    }
+    let e = c.exec();
+    eprintln!("tmac: cannot run {:?}: {e}", command[0]);
+    127
 }

@@ -277,9 +277,13 @@ fn exited_agents_and_stale_hooks() {
 #[test]
 fn codex_driver() {
     let env = Env::new();
-    env.spawn("c1", "codex", &[], &["first prompt"]);
-    assert_eq!(env.prompts("c1"), ["first prompt"]);
-    // tmac runs the command as given: its hooks are in the user's settings.
+    // The driver adds its first prompt: Codex fires no hook until it gets one.
+    env.spawn("c1", "codex", &[], &[]);
+    let first = env.prompts("c1");
+    assert_eq!(first.len(), 1);
+    assert!(first[0].starts_with("Do nothing now"), "{first:?}");
+    // tmac runs the command as given (its hooks are in the user's
+    // settings), plus the first prompt.
     let agent: serde_yaml_ng::Value = serde_yaml_ng::from_str(
         &std::fs::read_to_string(env.agent_dir("c1").join("agent.yml")).unwrap(),
     )
@@ -291,7 +295,7 @@ fn codex_driver() {
         .map(|v| v.as_str().unwrap())
         .collect();
     assert_eq!(command.len(), 2, "{command:?}");
-    assert_eq!(command[1], "first prompt");
+    assert_eq!(command[1], first[0]);
     env.ok(&["send", "c1", "second"]);
     // Esc fires Interrupt, which makes the agent idle again.
     env.ok(&["send", "c1", "busy 30"]);
@@ -306,22 +310,34 @@ fn codex_driver() {
         env.events("c1").iter().any(|e| e["event"] == "exit"),
         "graceful /quit"
     );
+
+    // The caller can give its own first prompt, or none.
+    env.spawn("c3", "codex", &["--first-prompt", "my own"], &[]);
+    assert_eq!(env.prompts("c3"), ["my own"]);
+    env.ok(&["kill", "c3"]);
+    env.spawn("c4", "codex", &["--no-first-prompt"], &["in the command"]);
+    assert_eq!(env.prompts("c4"), ["in the command"]);
+    env.ok(&["kill", "c4"]);
 }
 
 #[test]
 fn codex_without_a_first_prompt_times_out() {
     let env = Env::new();
     let fake = common::fake_as(&env, "codex");
-    env.expect(
-        &[
-            "spawn",
-            "c2",
-            "--timeout",
-            "2",
-            "--",
-            fake.to_str().unwrap(),
-        ],
-        3,
+    let out = env.tmac(&[
+        "spawn",
+        "c2",
+        "--no-first-prompt",
+        "--timeout",
+        "2",
+        "--",
+        fake.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(3));
+    // The driver's hint is shown.
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Codex needs an instruction"),
+        "{out:?}"
     );
     assert_eq!(state(&env, "c2"), "starting");
     env.ok(&["kill", "c2", "--force"]);
@@ -602,8 +618,7 @@ fn hooks_of_nested_clis_are_ignored() {
 fn session_changes_with_clear() {
     for driver in ["claude", "codex"] {
         let env = Env::new();
-        let first: &[&str] = if driver == "codex" { &["start"] } else { &[] };
-        env.spawn("s1", driver, &[], first);
+        env.spawn("s1", driver, &[], &[]);
         let before = env.field("s1", "session_id");
         // A person clears the session in the pane (no UserPromptSubmit).
         env.tmux(&["send-keys", "-t", "=work-dir:=s1", "-l", "/clear"]);
@@ -671,4 +686,72 @@ fn a_new_cli_runs_with_a_users_driver() {
     assert_eq!(env.prompts("m1"), ["hello"]);
     env.ok(&["kill", "m1"]);
     assert!(env.events("m1").iter().any(|e| e["event"] == "exit"));
+}
+
+#[test]
+fn session_variables_of_a_parent_cli_are_removed() {
+    let env = Env::new();
+    let fake = common::fake_as(&env, "claude");
+    let log = format!("FAKE_LOG={}", env.log_path("v1").display());
+    // As if run from inside a Claude Code session (the tmux server and the
+    // agent get this environment).
+    let out = env
+        .cmd(&["spawn", "v1", "-e", &log, "--", fake.to_str().unwrap()])
+        .env("CLAUDECODE", "1")
+        .env("CLAUDE_CODE_SESSION_ID", "parent")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let start = env
+        .events("v1")
+        .into_iter()
+        .find(|e| e["event"] == "start")
+        .unwrap();
+    let vars = start["env"].as_object().unwrap();
+    assert!(!vars.contains_key("CLAUDECODE"), "{vars:?}");
+    assert!(!vars.contains_key("CLAUDE_CODE_SESSION_ID"), "{vars:?}");
+    // The user's settings and tmac's variables stay.
+    assert!(vars.contains_key("CLAUDE_CONFIG_DIR"), "{vars:?}");
+    assert_eq!(vars["TMAC_AGENT"], "v1");
+    // The record keeps the command as the CLI got it.
+    let agent = std::fs::read_to_string(env.agent_dir("v1").join("agent.yml")).unwrap();
+    assert!(!agent.contains("exec-clean"), "{agent}");
+    env.ok(&["kill", "v1"]);
+}
+
+#[test]
+fn relays_get_the_working_directory_and_whether_the_stop_continues() {
+    let env = Env::new();
+    let seen = env.tmp.path().join("seen");
+    let marker = env.tmp.path().join("once");
+    let stop = format!(
+        "Stop=cat >/dev/null; echo \"$TMAC_CWD $TMAC_STOP_ACTIVE\" >> '{s}'; \
+         if [ ! -e '{m}' ]; then touch '{m}'; echo again >&2; exit 2; fi",
+        s = seen.display(),
+        m = marker.display()
+    );
+    env.spawn("r2", "claude", &["--relay", &stop], &[]);
+    env.ok(&["send", "r2", "x"]);
+    env.ok(&["wait", "r2", "--timeout", "10"]);
+    env.until("two stops", || {
+        std::fs::read_to_string(&seen)
+            .unwrap_or_default()
+            .lines()
+            .count()
+            == 2
+    });
+    let cwd = env.work.canonicalize().unwrap();
+    let lines: Vec<String> = std::fs::read_to_string(&seen)
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            format!("{} false", cwd.display()),
+            format!("{} true", cwd.display())
+        ]
+    );
+    env.ok(&["kill", "r2"]);
 }
