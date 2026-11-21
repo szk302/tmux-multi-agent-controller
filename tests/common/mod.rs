@@ -34,6 +34,55 @@ pub fn fake_as(env: &Env, driver: &str) -> PathBuf {
     link
 }
 
+pub const CLAUDE_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Notification",
+    "PermissionRequest",
+    "Stop",
+    "SessionEnd",
+];
+
+pub const CODEX_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PermissionRequest",
+    "Stop",
+    "Interrupt",
+    "SessionEnd",
+];
+
+/// A hooks object as rulesync writes it for the user (§5.5).
+pub fn hooks_json(driver: &str, events: &[&str], timeout: u64) -> Value {
+    let mut m = serde_json::Map::new();
+    for ev in events {
+        m.insert(
+            ev.to_string(),
+            serde_json::json!([{"hooks": [{
+                "type": "command",
+                "command": format!(
+                    "command -v tmac >/dev/null 2>&1 || exit 0; exec tmac hook {driver} {ev}"
+                ),
+                "timeout": timeout,
+            }]}]),
+        );
+    }
+    serde_json::json!({ "hooks": m })
+}
+
+/// The directory of the tmac binary under test, put first in PATH.
+pub fn tmac_dir() -> PathBuf {
+    Path::new(env!("CARGO_BIN_EXE_tmac"))
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
 impl Env {
     pub fn new() -> Env {
         Env::with_config("")
@@ -41,6 +90,35 @@ impl Env {
 
     /// `extra` is appended to the configuration file.
     pub fn with_config(extra: &str) -> Env {
+        let env = Env::bare(extra);
+        env.install_hooks();
+        env
+    }
+
+    /// Install tmac's hooks in the CLIs' user settings, like rulesync does.
+    pub fn install_hooks(&self) {
+        std::fs::write(
+            self.claude_dir().join("settings.json"),
+            hooks_json("claude", CLAUDE_EVENTS, 30).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            self.codex_dir().join("hooks.json"),
+            hooks_json("codex", CODEX_EVENTS, 30).to_string(),
+        )
+        .unwrap();
+    }
+
+    pub fn claude_dir(&self) -> PathBuf {
+        self.tmp.path().join("claude")
+    }
+
+    pub fn codex_dir(&self) -> PathBuf {
+        self.tmp.path().join("codex")
+    }
+
+    /// Without tmac's hooks.
+    pub fn bare(extra: &str) -> Env {
         let tmp = tempfile::Builder::new()
             .prefix("tmac-test.")
             .tempdir()
@@ -73,7 +151,11 @@ impl Env {
 
     pub fn cmd(&self, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_tmac"));
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut dirs = vec![tmac_dir()];
+        dirs.extend(std::env::split_paths(&path));
         c.args(args)
+            .env("PATH", std::env::join_paths(dirs).unwrap())
             .env("TMAC_HOME", &self.home)
             .env("CLAUDE_CONFIG_DIR", self.tmp.path().join("claude"))
             .env("CODEX_HOME", self.tmp.path().join("codex"))

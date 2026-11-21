@@ -93,6 +93,9 @@ pub struct StateFile {
     pub last_event_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_status: Option<i64>,
+    /// Session ID of the CLI, from the first hook that has one (§6.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 impl StateFile {
@@ -105,6 +108,7 @@ impl StateFile {
             last_event: None,
             last_event_at: None,
             exit_status: None,
+            session_id: None,
         }
     }
 }
@@ -373,18 +377,14 @@ fn human_expired(h: &HoldFile, st: &StateFile, human_hold: f64) -> bool {
 }
 
 /// Create a record in `.creating/` and move it into place (§4.3, §5.3).
-pub fn create(home: &Home, info: &AgentFile, driver_files: &[(String, Vec<u8>)]) -> Result<Agent> {
+pub fn create(home: &Home, info: &AgentFile) -> Result<Agent> {
     let staging = home
         .creating()
         .join(format!("{}.{}.{}", info.project, info.name, info.instance));
     fs::create_dir_all(staging.join("holds"))?;
-    fs::create_dir_all(staging.join("driver"))?;
     let r = (|| -> Result<()> {
         write_yaml(&staging.join("agent.yml"), info)?;
         write_yaml(&staging.join("state.yml"), &StateFile::new(State::Starting))?;
-        for (name, data) in driver_files {
-            util::write_atomic(&staging.join("driver").join(name), data)?;
-        }
         Ok(())
     })();
     if let Err(e) = r {

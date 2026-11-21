@@ -34,7 +34,6 @@ install "tmac-$v-$t/tmac" ~/.local/bin/
 ```
 
 アーカイブには、`LICENSE` と、同梱しているサードパーティーのライセンス表示（`THIRD-PARTY-LICENSES.txt`、Linux 版は `MUSL-COPYRIGHT` も）が入っています。
-Codex のフックの信頼は、tmac の実行ファイルの場所ごとに記録されます（§5.5.1）。置き場所を変えたら、Codex の画面で 1 回だけ信頼し直してください。
 
 ### ソースから
 
@@ -46,6 +45,41 @@ cargo install --locked --path .
 ```
 
 実行には tmux と `/bin/sh` が必要です（tmux 3.7c で確認）。
+
+## フックを入れる（最初に 1 回）
+
+tmac は CLI の設定を書きません。tmac のフックは、利用者の CLI の設定（`~/.claude/settings.json`、`~/.codex/hooks.json`）に 1 回だけ入れます。フックは `PATH` から `tmac` を探し、tmac の外で起動した CLI（`TMAC_*` の環境変数がない）では何もせずに終わります。
+
+[rulesync](https://github.com/dyoshikawa/rulesync) を使う場合は、tmac が書き出した元のファイルから入れます。
+
+```bash
+tmac hooks rulesync ~/.tmac/rulesync
+cd ~/.tmac/rulesync    # rulesync は -c にカレントディレクトリの外のパスを受け付けません
+rulesync generate --global -c rulesync.jsonc --input-roots .
+```
+
+- 手で入れたフックは残ります（`preserveUnownedHooks: true`）。自分のフックも rulesync で入れたいときは、その `hooks.jsonc` を `--merge` で渡してください。rulesync は、利用者全体のフックを 1 つの元のファイルで管理するためです。
+- tmac を更新したら、同じ手順をやり直してください。
+
+手で入れる場合は、次の形のフックを、Claude Code は `SessionStart`・`UserPromptSubmit`・`PreToolUse`・`PostToolUse`・`PostToolUseFailure`・`Notification`・`PermissionRequest`・`Stop`・`SessionEnd` に、Codex は `SessionStart`・`UserPromptSubmit`・`PreToolUse`・`PostToolUse`・`PermissionRequest`・`Stop`・`Interrupt`・`SessionEnd` に書きます（`claude` の部分はドライバ名）。Codex の `Interrupt`・`SessionEnd` の `timeout` は 3 にします。
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "command -v tmac >/dev/null 2>&1 || exit 0; exec tmac hook claude Stop", "timeout": 30 } ] }
+    ]
+  }
+}
+```
+
+Codex は、最初に起動したときだけ、tmac のフックを信頼するか画面で確認します。信頼はフックの定義ごとに記録され、プロジェクトや worktree ごとには聞かれません。
+
+入ったかどうかは、`tmac doctor` で確かめられます。`tmac spawn` も起動の前に同じことを確かめ、フックが足りない・重なっている、`PATH` に tmac がない、といった場合は起動しません。
+
+```bash
+tmac doctor            # claude と codex の両方（tmac doctor codex で片方だけ）
+```
 
 ## 使い方
 
@@ -98,8 +132,10 @@ tmac spawn impl-001 --relay 'Stop=lmm hook' --env LMM_NAME=impl-001 --pass-env P
 
 | ドライバ | CLI | 注意 |
 | :--- | :--- | :--- |
-| `claude` | Claude Code | フックは `--settings` で加えます（呼び出し側の `--settings` とは合成します）。`Stop`・`UserPromptSubmit` に tmac 以外のフック（プラグインを含む）があると、起動を断ります。停止を止めないフックなら `--allow-foreign-hooks` で起動できます。 |
-| `codex` | Codex CLI | フックは `-c hooks.*` で加えます。Codex は起動しただけではフックを呼ばないため、**最初の指示を起動コマンドの引数で渡します**（例: `-- codex "待機してください"`）。tmac のフックは最初の 1 回だけ、Codex の画面で信頼の確認が要ります。 |
+| `claude` | Claude Code | `Stop`・`UserPromptSubmit` に tmac 以外のフック（プラグインを含む）があると、起動を断ります。停止を止めないフックなら `--allow-foreign-hooks` で起動できます。 |
+| `codex` | Codex CLI | Codex は起動しただけではフックを呼ばないため、**最初の指示を起動コマンドの引数で渡します**（例: `-- codex "待機してください"`）。 |
+
+エージェントの中で起動した別の CLI（Bash ツールから実行した `claude -p` など）も、利用者全体の tmac のフックを呼びます。tmac は、ドライバとセッション ID が記録と合わないフックを無視するので、エージェントの状態は変わりません。`/clear` などでセッションが変わったときは、エージェントが入力待ちのときに来た `SessionStart` で、新しいセッションに切り替えます。
 
 ドライバは、起動コマンドのファイル名（`claude`・`codex`）から決めます。`env` などのラッパーを通す場合は `--driver` を指定します。
 
@@ -130,14 +166,14 @@ relay:
 | :--- | :--- |
 | 0 | 成功 |
 | 1 | 実行時エラー |
-| 2 | 使い方・設定の誤り（`spawn` で tmac 以外のフックが見つかった場合を含む） |
+| 2 | 使い方・設定の誤り（`spawn` で、tmac のフックが足りない・重なっている、`PATH` に tmac がない、tmac 以外のフックが見つかった場合を含む） |
 | 3 | 時間切れ |
 | 4 | エージェントがない（終了した、別の起動に置き換わった場合を含む） |
 | 5 | 入力できない、または保留中 |
 | 6 | 入力を確認できなかった（`unconfirmed` の保留を設定した） |
 | 7 | 中継が入力を拒否した |
 
-`tmac hook`（CLI のフックが呼ぶ）は、中継を実行した場合はその終了コードを返し、それ以外では 2 を返しません。
+`tmac hook`（CLI のフックが呼ぶ）は、中継を実行した場合はその終了コードを返し、それ以外では 2 を返しません。`tmac doctor` は、起動できる状態なら 0、そうでなければ 1 を返します。
 
 ## 開発
 
@@ -147,7 +183,7 @@ mise run test    # 結合テストは tmux と Python 3.11 以上を使う
 mise run lint
 ```
 
-結合テスト（`tests/agents.rs`）は、テストごとに専用の tmux サーバーとデータディレクトリを作り、フックを本物と同じように呼ぶ偽の CLI（`tests/fake_cli.py`）を起動します。
+結合テスト（`tests/agents.rs`）は、テストごとに専用の tmux サーバーとデータディレクトリを作り、仮の `CLAUDE_CONFIG_DIR`・`CODEX_HOME` に tmac のフックを入れてから、フックを本物と同じように呼ぶ偽の CLI（`tests/fake_cli.py`）を起動します。
 
 ### リリース
 

@@ -153,6 +153,8 @@ struct StatusOut {
     pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     exit_status: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
     created_at: String,
 }
 
@@ -177,6 +179,7 @@ fn status_of(agent: &Agent) -> Result<StatusOut> {
         },
         pid: pane.as_ref().filter(|p| !p.dead).and_then(|p| p.pid),
         exit_status: st.exit_status,
+        session_id: st.session_id.clone(),
         created_at: agent.info.created_at.clone(),
     })
 }

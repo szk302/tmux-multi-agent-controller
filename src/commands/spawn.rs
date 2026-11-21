@@ -5,9 +5,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::config;
-use crate::driver::{Driver, PrepareCtx};
+use crate::driver::Driver;
 use crate::error::{Error, Result};
 use crate::home::Home;
+use crate::hookconf::{self, Check, Dirs};
 use crate::ops;
 use crate::project::{self, AgentRef};
 use crate::record::{self, Agent, AgentFile, State, TmuxInfo};
@@ -127,40 +128,14 @@ pub fn run(a: SpawnArgs) -> Result<()> {
         return Err(Error::usage("times must not be negative"));
     }
 
-    let instance = uuid::Uuid::new_v4().hyphenated().to_string();
-    let exe = std::env::current_exe()?.canonicalize()?;
-    let driver_dir = home.agent_dir(&key).join("driver");
-    let prepared = driver.prepare(
-        &PrepareCtx {
-            exe: &exe,
-            project: &key.project,
-            name: &key.name,
-            instance: &instance,
-            driver_dir: &driver_dir,
-            cwd: &cwd,
-            relay_timeout: cfg.relay_timeout,
-        },
+    check_hooks(
+        driver,
+        &cwd,
         &a.command,
+        &relay,
+        &cfg,
+        a.allow_foreign_hooks,
     )?;
-    if !a.allow_foreign_hooks {
-        let found: Vec<String> = driver
-            .foreign_hooks(&cwd, &prepared)
-            .into_iter()
-            .filter(|place| !cfg.allow_foreign_hooks.allows(place))
-            .collect();
-        if !found.is_empty() {
-            let mut msg = String::from(
-                "hooks other than tmac's can block Stop or UserPromptSubmit, so tmac cannot tell the state \
-                 reliably. Move them to --relay, or pass --allow-foreign-hooks (or list them in \
-                 spawn.allow_foreign_hooks of the configuration) if they never block:",
-            );
-            for f in found {
-                msg.push_str("\n  ");
-                msg.push_str(&f);
-            }
-            return Err(Error::Usage(msg));
-        }
-    }
 
     if let Some(old) = Agent::load(&home, &key)? {
         let exited = ops::reconcile(&old)
@@ -172,6 +147,7 @@ pub fn run(a: SpawnArgs) -> Result<()> {
         )));
     }
 
+    let instance = uuid::Uuid::new_v4().hyphenated().to_string();
     let mut env_all: Vec<(String, String)> = vec![
         ("TMAC_PROJECT".into(), key.project.clone()),
         ("TMAC_AGENT".into(), key.name.clone()),
@@ -196,7 +172,7 @@ pub fn run(a: SpawnArgs) -> Result<()> {
         created_at: util::now_stamp(),
         spawn_timeout: timeout,
         cwd: cwd.to_string_lossy().into_owned(),
-        command: prepared.command.clone(),
+        command: a.command.clone(),
         env_names: env_pairs.iter().map(|(k, _)| k.clone()).collect(),
         tmux: TmuxInfo {
             socket_name: cfg.tmux_socket_name.clone(),
@@ -207,10 +183,10 @@ pub fn run(a: SpawnArgs) -> Result<()> {
         relay,
         human_hold,
     };
-    let mut agent = record::create(&home, &info, &prepared.files)?;
+    let mut agent = record::create(&home, &info)?;
 
     let tmux = Tmux::with_socket_name(cfg.tmux_socket_name.as_deref());
-    let (pane, socket) = match create_pane(&tmux, &agent.info, &cwd, &env_all, &prepared.command) {
+    let (pane, socket) = match create_pane(&tmux, &agent.info, &cwd, &env_all, &a.command) {
         Ok(v) => v,
         Err(e) => {
             let _ = record::remove(&agent);
@@ -247,6 +223,77 @@ pub fn run(a: SpawnArgs) -> Result<()> {
         }
         util::sleep_checked(Duration::from_millis(500), &sig)?;
     }
+}
+
+/// Check the hooks the CLI will run before starting it (§5.6): tmac's hook
+/// once for every event, `tmac` in PATH, time limits long enough for the
+/// relays, and no other hooks that can block.
+fn check_hooks(
+    driver: Driver,
+    cwd: &std::path::Path,
+    command: &[String],
+    relay: &BTreeMap<String, String>,
+    cfg: &config::Config,
+    allow_foreign: bool,
+) -> Result<()> {
+    let c = Check::run(driver, &Dirs::from_env(), cwd, command)?;
+    let missing = c.missing();
+    if !missing.is_empty() {
+        return Err(Error::usage(format!(
+            "tmac's {} hooks are not installed (missing: {}); {}",
+            driver.name(),
+            missing.join(", "),
+            hookconf::INSTALL_HINT
+        )));
+    }
+    let dup = c.duplicated();
+    if !dup.is_empty() {
+        let mut msg = format!(
+            "tmac's {} hooks are installed more than once, so each event would be counted twice; \
+             keep one of each:",
+            driver.name()
+        );
+        for (ev, places) in dup {
+            msg.push_str(&format!("\n  {ev}: {}", places.join(", ")));
+        }
+        return Err(Error::Usage(msg));
+    }
+    if c.tmac_on_path.is_none() {
+        return Err(Error::usage(
+            "tmac is not in PATH, so the hooks would do nothing; add its directory to PATH \
+             (the agent gets the PATH of this command)",
+        ));
+    }
+    let short = c.short_timeouts(relay.keys().map(String::as_str), cfg.relay_timeout);
+    if !short.is_empty() {
+        let list: Vec<String> = short.iter().map(|(e, t)| format!("{e} ({t}s)")).collect();
+        return Err(Error::usage(format!(
+            "the time limits of tmac's hooks must be at least relay.timeout + 10 = {}s for the \
+             relayed events: {}",
+            cfg.relay_timeout + 10.0,
+            list.join(", ")
+        )));
+    }
+    if !allow_foreign {
+        let found: Vec<&String> = c
+            .foreign
+            .iter()
+            .filter(|place| !cfg.allow_foreign_hooks.allows(place))
+            .collect();
+        if !found.is_empty() {
+            let mut msg = String::from(
+                "hooks other than tmac's can block Stop or UserPromptSubmit, so tmac cannot tell the state \
+                 reliably. Move them to --relay, or pass --allow-foreign-hooks (or list them in \
+                 spawn.allow_foreign_hooks of the configuration) if they never block:",
+            );
+            for f in found {
+                msg.push_str("\n  ");
+                msg.push_str(f);
+            }
+            return Err(Error::Usage(msg));
+        }
+    }
+    Ok(())
 }
 
 /// Create the window, tag the pane and name the window in one tmux call

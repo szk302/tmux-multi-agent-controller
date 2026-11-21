@@ -279,11 +279,19 @@ fn codex_driver() {
     let env = Env::new();
     env.spawn("c1", "codex", &[], &["first prompt"]);
     assert_eq!(env.prompts("c1"), ["first prompt"]);
-    let agent = std::fs::read_to_string(env.agent_dir("c1").join("agent.yml")).unwrap();
-    assert!(
-        agent.contains("hook codex Stop") && !agent.contains("--instance"),
-        "{agent}"
-    );
+    // tmac runs the command as given: its hooks are in the user's settings.
+    let agent: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+        &std::fs::read_to_string(env.agent_dir("c1").join("agent.yml")).unwrap(),
+    )
+    .unwrap();
+    let command: Vec<&str> = agent["command"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(command.len(), 2, "{command:?}");
+    assert_eq!(command[1], "first prompt");
     env.ok(&["send", "c1", "second"]);
     // Esc fires Interrupt, which makes the agent idle again.
     env.ok(&["send", "c1", "busy 30"]);
@@ -435,4 +443,182 @@ fn projects_keep_agents_apart() {
     env.ok(&["kill", "repo-a/coder"]);
     env.ok(&["-p", "repo.b", "kill", "coder"]);
     assert_eq!(env.ok(&["list", "-a", "-q"]), "");
+}
+
+fn stderr(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn spawn_needs_tmacs_hooks_once() {
+    let env = Env::bare("");
+    let fake = common::fake_as(&env, "claude");
+    let out = env.tmac(&["spawn", "n1", "--", fake.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("not installed"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("tmac hooks rulesync"));
+    assert!(!env.agent_dir("n1").exists());
+
+    // Only some events: the missing ones are named.
+    std::fs::write(
+        env.claude_dir().join("settings.json"),
+        common::hooks_json("claude", &["Stop"], 30).to_string(),
+    )
+    .unwrap();
+    let out = env.tmac(&["spawn", "n1", "--", fake.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).contains("missing: SessionStart"),
+        "{}",
+        stderr(&out)
+    );
+
+    // Twice: in the user's settings and in the caller's --settings.
+    env.install_hooks();
+    let twice = common::hooks_json("claude", &["Stop"], 30).to_string();
+    let out = env.tmac(&[
+        "spawn",
+        "n1",
+        "--",
+        fake.to_str().unwrap(),
+        "--settings",
+        &twice,
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("more than once"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("Stop:"), "{}", stderr(&out));
+}
+
+#[test]
+fn spawn_needs_tmac_in_path() {
+    let env = Env::new();
+    let fake = common::fake_as(&env, "claude");
+    let out = env
+        .cmd(&["spawn", "n2", "--", fake.to_str().unwrap()])
+        .env("PATH", env.tmp.path().join("nowhere"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("not in PATH"), "{}", stderr(&out));
+}
+
+#[test]
+fn spawn_needs_hook_time_limits_for_relays() {
+    let env = Env::with_config("relay:\n  timeout: 25\n");
+    let fake = common::fake_as(&env, "claude");
+    let out = env.tmac(&[
+        "spawn",
+        "n3",
+        "--relay",
+        "Stop=true",
+        "--",
+        fake.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("Stop (30s)"), "{}", stderr(&out));
+    // Events without a relay do not matter.
+    env.spawn("n3", "claude", &[], &[]);
+    env.ok(&["kill", "n3"]);
+}
+
+#[test]
+fn doctor_checks_without_starting() {
+    let env = Env::new();
+    let out = env.ok(&["doctor"]);
+    assert!(out.contains("claude: tmac's hooks: ok (9 events"), "{out}");
+    assert!(out.contains("codex: tmac's hooks: ok (8 events"), "{out}");
+    assert!(out.contains("tmac in PATH: "), "{out}");
+    std::fs::remove_file(env.codex_dir().join("hooks.json")).unwrap();
+    let out = env.tmac(&["doctor", "codex"]);
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("codex: tmac's hooks: missing"), "{text}");
+    assert!(!text.contains("claude:"), "{text}");
+    env.expect(&["doctor", "nope"], 2);
+}
+
+#[test]
+fn hooks_rulesync_writes_the_sources() {
+    let env = Env::new();
+    let dir = env.tmp.path().join("rs");
+    let mine = env.tmp.path().join("mine.jsonc");
+    std::fs::write(
+        &mine,
+        "// my hooks\n{\n  \"hooks\": {\"sessionStart\": [{\"command\": \"echo hi\"}]},\n}\n",
+    )
+    .unwrap();
+    let out = env.ok(&[
+        "hooks",
+        "rulesync",
+        dir.to_str().unwrap(),
+        "--merge",
+        mine.to_str().unwrap(),
+    ]);
+    assert_eq!(out.lines().count(), 2, "{out}");
+    let read = |name: &str| -> serde_json::Value {
+        let text = std::fs::read_to_string(dir.join(name)).unwrap();
+        let body: String = text
+            .lines()
+            .filter(|l| !l.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        serde_json::from_str(&body).unwrap()
+    };
+    let hooks = read("hooks.jsonc");
+    assert_eq!(hooks["hooks"]["sessionStart"][0]["command"], "echo hi");
+    assert_eq!(
+        hooks["codexcli"]["hooks"]["Stop"][0]["command"],
+        "command -v tmac >/dev/null 2>&1 || exit 0; exec tmac hook codex Stop"
+    );
+    let config = read("rulesync.jsonc");
+    assert_eq!(config["features"], serde_json::json!(["hooks"]));
+}
+
+#[test]
+fn hooks_of_nested_clis_are_ignored() {
+    let env = Env::new();
+    env.spawn("x1", "claude", &[], &[]);
+    let sid = env.field("x1", "session_id");
+    assert!(!sid.is_empty());
+    env.ok(&["send", "x1", "nested"]);
+    env.ok(&["wait", "x1", "--timeout", "10"]);
+    env.until("the nested hooks", || {
+        env.events("x1").iter().any(|e| e["event"] == "nested")
+    });
+    let log = std::fs::read_to_string(env.agent_dir("x1").join("events.log")).unwrap();
+    assert!(
+        log.contains("SessionStart ignored (session nested)"),
+        "{log}"
+    );
+    assert!(log.contains("Stop ignored (session nested)"), "{log}");
+    assert!(log.contains("Stop ignored (a codex hook)"), "{log}");
+    // Only the agent's own Stop counted.
+    assert_eq!(log.matches(" Stop busy->idle").count(), 1, "{log}");
+    assert_eq!(env.field("x1", "session_id"), sid);
+    env.ok(&["kill", "x1"]);
+}
+
+#[test]
+fn session_changes_with_clear() {
+    for driver in ["claude", "codex"] {
+        let env = Env::new();
+        let first: &[&str] = if driver == "codex" { &["start"] } else { &[] };
+        env.spawn("s1", driver, &[], first);
+        let before = env.field("s1", "session_id");
+        // A person clears the session in the pane (no UserPromptSubmit).
+        env.tmux(&["send-keys", "-t", "=work-dir:=s1", "-l", "/clear"]);
+        env.tmux(&["send-keys", "-t", "=work-dir:=s1", "Enter"]);
+        env.until("the clear", || {
+            env.events("s1").iter().any(|e| e["event"] == "cleared")
+        });
+        // tmac follows the new session, so its input is confirmed.
+        env.ok(&["send", "s1", "after clear"]);
+        env.ok(&["wait", "s1", "--timeout", "10"]);
+        let after = env.field("s1", "session_id");
+        assert_ne!(before, after, "{driver}");
+        // codex ends every session it had when it quits; only the current
+        // one ends the agent.
+        env.ok(&["kill", "s1"]);
+        assert!(env.events("s1").iter().any(|e| e["event"] == "exit"));
+    }
 }

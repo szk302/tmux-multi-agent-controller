@@ -7,6 +7,7 @@ pub mod config;
 pub mod driver;
 pub mod error;
 pub mod home;
+pub mod hookconf;
 pub mod ops;
 pub mod project;
 pub mod record;
@@ -15,8 +16,8 @@ pub mod util;
 
 use clap::Parser;
 
-use crate::cli::{Cli, Cmd};
-use crate::commands::{hook, input, manage, spawn};
+use crate::cli::{Cli, Cmd, HooksCmd};
+use crate::commands::{hook, hooks, input, manage, spawn};
 
 /// Run the command line and return the exit code.
 pub fn run() -> i32 {
@@ -97,6 +98,12 @@ pub fn run() -> i32 {
             }
         }
         Cmd::Kill(k) => target(&k.name).and_then(|r| manage::kill(&r, k.timeout, k.force)),
+        Cmd::Doctor(d) => match hooks::doctor(&d.drivers, d.cwd.as_deref()) {
+            Ok(true) => Ok(()),
+            Ok(false) => return 1,
+            Err(e) => Err(e),
+        },
+        Cmd::Hooks(HooksCmd::Rulesync(r)) => hooks::rulesync(&r.dir, r.merge.as_deref(), &r.target),
     };
     match result {
         Ok(()) => 0,
