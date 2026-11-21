@@ -118,7 +118,13 @@ pub fn run(args: HookArgs) -> i32 {
         .filter(|c| !c.trim().is_empty())
         .cloned();
     let (code, blocked) = match &relay {
-        Some(cmd) => run_relay(&driver, cmd, &payload, event, cfg.relay_timeout),
+        Some(cmd) => {
+            let mut env = vec![("TMAC_CWD", agent.info.cwd.clone())];
+            if let Some(active) = driver.stop_active(event, &json) {
+                env.push(("TMAC_STOP_ACTIVE", active.to_string()));
+            }
+            run_relay(&driver, cmd, &payload, event, &env, cfg.relay_timeout)
+        }
         None => (0, false),
     };
 
@@ -323,11 +329,19 @@ fn apply_after(
 
 /// Run the relay command with the hook input (§6.3). Returns its exit code
 /// and whether it blocked.
-fn run_relay(driver: &Driver, cmd: &str, payload: &[u8], event: &str, timeout: f64) -> (i32, bool) {
+fn run_relay(
+    driver: &Driver,
+    cmd: &str,
+    payload: &[u8],
+    event: &str,
+    env: &[(&str, String)],
+    timeout: f64,
+) -> (i32, bool) {
     let mut child = match Command::new("/bin/sh")
         .arg("-c")
         .arg(cmd)
         .env("TMAC_EVENT", event)
+        .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())

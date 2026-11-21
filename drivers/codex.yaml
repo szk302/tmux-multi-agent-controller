@@ -20,6 +20,7 @@ events:
 payload:
   session_id: session_id
   prompt: prompt
+  stop_active: stop_hook_active
 
 input:
   submit_delay_ms: 500
@@ -39,6 +40,17 @@ hooks:
     - {file: "{project_layers}/.codex/config.toml", format: toml}
     # -c hooks.EVENT=VALUE
     - {arg: [-c, --config], format: toml-assign}
+
+spawn:
+  # Codex fires no hook until it gets an instruction, so spawn adds this as
+  # the last argument (--first-prompt changes it, --no-first-prompt leaves it
+  # out). The agent is idle after the reply.
+  first_prompt: Do nothing now and end your reply; instructions will follow.
+  hints:
+    timeout: >-
+      is it waiting for a confirmation, such as trusting the folder or tmac's
+      hooks? Look at the pane. (Codex needs an instruction to start: did the
+      command line give one?)
 
 rulesync:
   target: codexcli

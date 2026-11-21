@@ -187,7 +187,9 @@ class Input:
 def main():
     term = Term()
     inp = Input()
-    log(event="start", mode=MODE, args=sys.argv[1:])
+    log(event="start", mode=MODE, args=sys.argv[1:],
+        env={k: v for k, v in os.environ.items()
+             if k.startswith(("CLAUDE", "CODEX", "TMAC_"))})
 
     def wait_for_key(key, seconds):
         """Wait for a key, or ESC (returns 'esc')."""

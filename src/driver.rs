@@ -130,6 +130,7 @@ struct Spec {
     events: Vec<(String, Vec<Rule>)>,
     session_id_key: Option<String>,
     prompt_key: String,
+    stop_active_key: Option<String>,
     generated: Vec<String>,
     submit_delay_ms: u64,
     exit_text: Option<String>,
@@ -137,6 +138,9 @@ struct Spec {
     default_timeout: Option<f64>,
     places: Vec<Place>,
     rulesync: Option<Rulesync>,
+    first_prompt: Option<String>,
+    session_env: Vec<String>,
+    timeout_hint: Option<String>,
 }
 
 /// A driver: cheap to clone.
@@ -163,6 +167,24 @@ struct RawSpec {
     #[serde(default)]
     hooks: RawHooks,
     rulesync: Option<RawRulesync>,
+    #[serde(default)]
+    spawn: RawSpawn,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawSpawn {
+    first_prompt: Option<String>,
+    #[serde(default)]
+    session_env: Vec<String>,
+    #[serde(default)]
+    hints: RawHints,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawHints {
+    timeout: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -170,6 +192,7 @@ struct RawSpec {
 struct RawPayload {
     session_id: Option<String>,
     prompt: Option<String>,
+    stop_active: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -412,6 +435,18 @@ fn parse_spec(name: &str, source: Source, text: &str) -> std::result::Result<Spe
         timeout: r.timeout.unwrap_or(30),
         timeouts: r.timeouts,
     });
+    for v in &raw.spawn.session_env {
+        let name = v.strip_suffix('*').unwrap_or(v);
+        let b = name.as_bytes();
+        if b.is_empty()
+            || !(b[0].is_ascii_alphabetic() || b[0] == b'_')
+            || !b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+        {
+            return Err(format!(
+                "spawn.session_env: {v:?} is not a variable name (or a prefix ending with *)"
+            ));
+        }
+    }
     if let Some(r) = &rulesync {
         for ev in r.timeouts.keys() {
             if !events.iter().any(|(e, _)| e == ev) {
@@ -427,6 +462,7 @@ fn parse_spec(name: &str, source: Source, text: &str) -> std::result::Result<Spe
         events,
         session_id_key: raw.payload.session_id,
         prompt_key: raw.payload.prompt.unwrap_or_else(|| "prompt".into()),
+        stop_active_key: raw.payload.stop_active,
         generated: raw.prompt.generated,
         submit_delay_ms: raw.input.submit_delay_ms.unwrap_or(200),
         exit_text: raw.input.exit_text.filter(|t| !t.is_empty()),
@@ -434,6 +470,9 @@ fn parse_spec(name: &str, source: Source, text: &str) -> std::result::Result<Spe
         default_timeout: raw.hooks.default_timeout,
         places,
         rulesync,
+        first_prompt: raw.spawn.first_prompt.filter(|t| !t.trim().is_empty()),
+        session_env: raw.spawn.session_env,
+        timeout_hint: raw.spawn.hints.timeout.filter(|t| !t.trim().is_empty()),
     })
 }
 
@@ -588,6 +627,33 @@ impl Driver {
 
     pub fn places(&self) -> &[Place] {
         &self.0.places
+    }
+
+    /// The instruction added as the last argument when the CLI needs one to
+    /// start firing hooks (§5.3).
+    pub fn first_prompt(&self) -> Option<&str> {
+        self.0.first_prompt.as_deref()
+    }
+
+    /// Variables the CLI sets for its session (names, or prefixes ending
+    /// with `*`), removed from the agent's environment (§5.4).
+    pub fn session_env(&self) -> &[String] {
+        &self.0.session_env
+    }
+
+    /// What to suggest when `spawn` times out (§5.3).
+    pub fn timeout_hint(&self) -> Option<&str> {
+        self.0.timeout_hint.as_deref()
+    }
+
+    /// Whether the input of a `role: stop` event says the stop continues
+    /// one a relay stopped (`TMAC_STOP_ACTIVE`, §6.4); `None` if the driver
+    /// or the event has no such key.
+    pub fn stop_active(&self, event: &str, payload: &Value) -> Option<bool> {
+        let key = self.0.stop_active_key.as_deref()?;
+        self.rule(event, payload)
+            .filter(|r| r.role == Some(Role::Stop))?;
+        Some(payload.get(key).and_then(Value::as_bool).unwrap_or(false))
     }
 
     /// Name of the CLI in rulesync, if the driver can be installed with
@@ -792,6 +858,37 @@ mod tests {
     }
 
     #[test]
+    fn spawn_items_and_stop_active() {
+        let (claude, codex) = (builtin("claude"), builtin("codex"));
+        assert!(codex.first_prompt().is_some());
+        assert_eq!(claude.first_prompt(), None);
+        assert!(claude.session_env().iter().any(|v| v == "CLAUDECODE"));
+        assert!(
+            claude
+                .session_env()
+                .iter()
+                .any(|v| v == "CLAUDE_CODE_SESSION_*")
+        );
+        assert!(
+            !claude
+                .session_env()
+                .iter()
+                .any(|v| v == "CLAUDE_CONFIG_DIR")
+        );
+        assert!(
+            codex
+                .timeout_hint()
+                .is_some_and(|h| h.contains("instruction"))
+        );
+        assert_eq!(
+            claude.stop_active("Stop", &json!({"stop_hook_active": true})),
+            Some(true)
+        );
+        assert_eq!(claude.stop_active("Stop", &json!({})), Some(false));
+        assert_eq!(claude.stop_active("UserPromptSubmit", &json!({})), None);
+    }
+
+    #[test]
     fn invalid_files_are_reported() {
         let bad = |text: &str| match Driver::parse("x", Source::Builtin, text) {
             Ok(_) => panic!("accepted: {text}"),
@@ -825,5 +922,8 @@ mod tests {
             .contains("no such event")
         );
         assert!(Driver::parse("Bad", Source::Builtin, ok).is_err());
+        assert!(
+            bad(&format!("{ok}spawn:\n  session_env: [\"*\"]\n")).contains("spawn.session_env")
+        );
     }
 }

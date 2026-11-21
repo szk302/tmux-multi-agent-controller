@@ -49,6 +49,19 @@ pub enum Cmd {
     /// Show and check the drivers (built-in and $TMAC_HOME/drivers/)
     #[command(subcommand)]
     Driver(DriverCmd),
+    /// Run a command without some environment variables (spawn uses it in
+    /// the pane; not for direct use)
+    #[command(name = "exec-clean", hide = true)]
+    ExecClean(ExecCleanCli),
+}
+
+#[derive(Args, Debug)]
+pub struct ExecCleanCli {
+    /// A variable to remove, or a prefix ending with *
+    #[arg(long = "unset", value_name = "NAME")]
+    pub unset: Vec<String>,
+    #[arg(last = true, required = true, value_name = "COMMAND")]
+    pub command: Vec<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -117,6 +130,17 @@ pub struct SpawnCli {
     /// Start even if other hooks handle Stop or UserPromptSubmit
     #[arg(long = "allow-foreign-hooks")]
     pub allow_foreign_hooks: bool,
+    /// Instruction to add as the last argument instead of the driver's
+    /// (for CLIs that need one to start firing hooks)
+    #[arg(
+        long = "first-prompt",
+        value_name = "TEXT",
+        conflicts_with = "no_first_prompt"
+    )]
+    pub first_prompt: Option<String>,
+    /// Do not add the driver's first instruction (the command has one)
+    #[arg(long = "no-first-prompt")]
+    pub no_first_prompt: bool,
     /// Seconds to wait until the agent is idle
     #[arg(long, value_name = "SEC")]
     pub timeout: Option<f64>,
