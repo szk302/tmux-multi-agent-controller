@@ -14,7 +14,7 @@ use crate::error::{Result, warn};
 use crate::home::Home;
 use crate::ops;
 use crate::project::AgentRef;
-use crate::record::{Agent, HUMAN, HoldFile, Progress, State, UNCONFIRMED};
+use crate::record::{Agent, HUMAN, HoldFile, Progress, State, StateFile, UNCONFIRMED};
 use crate::util;
 
 pub struct HookArgs {
@@ -74,6 +74,17 @@ pub fn run(args: HookArgs) -> i32 {
             return 1;
         }
     };
+    // Hooks are installed for the user, so a CLI started inside the agent
+    // (another driver) runs them with the agent's environment (§6.2).
+    if agent.info.driver != driver.name() {
+        agent.log(
+            agent.state().map(|s| s.seq).unwrap_or(0),
+            "hook",
+            &args.event,
+            &format!("ignored (a {} hook)", driver.name()),
+        );
+        return 0;
+    }
     let cfg = config::load(&home).unwrap_or_else(|e| {
         warn(format!("{e}; using the default settings"));
         Config::default()
@@ -84,11 +95,12 @@ pub fn run(args: HookArgs) -> i32 {
     let mut failed = false;
     let before = driver.before(event, &json);
     let logged = match apply_before(&agent, driver, before, event, &json) {
-        Ok(Some(logged)) => logged,
-        Ok(None) => {
+        Ok(Outcome::Applied(logged)) => logged,
+        Ok(Outcome::Replaced) => {
             warn(format!("ignoring {event} hook: {key} was replaced"));
             return 0;
         }
+        Ok(Outcome::OtherSession) => return 0,
         Err(e) => {
             warn(format!("{event}: cannot update the state of {key}: {e}"));
             failed = true;
@@ -121,20 +133,66 @@ pub fn run(args: HookArgs) -> i32 {
     }
 }
 
-/// Changes before the relay. `Ok(None)` if the record was replaced;
-/// otherwise whether the event was logged.
+/// What [`apply_before`] did.
+enum Outcome {
+    /// The record was replaced by another instance.
+    Replaced,
+    /// The hook came from another session of the CLI, such as a CLI the
+    /// agent started (§6.2): ignored.
+    OtherSession,
+    /// Applied; whether the event was logged.
+    Applied(bool),
+}
+
+/// Keep the session ID of the agent's CLI (§6.2): record the first one, and
+/// switch only when a `SessionStart` of `/clear` or a resumed session comes
+/// while the agent is idle. Returns false for a hook of another session.
+fn same_session(
+    agent: &Agent,
+    driver: Driver,
+    st: &mut StateFile,
+    event: &str,
+    payload: &Value,
+) -> Result<bool> {
+    let Some(sid) = driver.session_id(payload) else {
+        return Ok(true);
+    };
+    match &st.session_id {
+        Some(cur) if *cur == sid => Ok(true),
+        None => {
+            st.session_id = Some(sid);
+            agent.write_state(st)?;
+            Ok(true)
+        }
+        Some(_) if st.state == State::Idle && driver.starts_new_session(event, payload) => {
+            agent.log(st.seq, "hook", event, &format!("session {sid}"));
+            st.session_id = Some(sid);
+            agent.write_state(st)?;
+            Ok(true)
+        }
+        Some(_) => {
+            agent.log(st.seq, "hook", event, &format!("ignored (session {sid})"));
+            Ok(false)
+        }
+    }
+}
+
+/// Changes before the relay.
 fn apply_before(
     agent: &Agent,
     driver: Driver,
     before: Before,
     event: &str,
     payload: &Value,
-) -> Result<Option<bool>> {
+) -> Result<Outcome> {
     let _g = agent.home.state_lock(&agent.key())?;
     if !agent.still_current()? {
-        return Ok(None);
+        return Ok(Outcome::Replaced);
     }
     let mut st = agent.state()?;
+    if !same_session(agent, driver, &mut st, event, payload)? {
+        return Ok(Outcome::OtherSession);
+    }
     agent.expire_holds(&st)?;
     let holds_before = agent.active_holds(&st)?;
     let from = st.state;
@@ -158,7 +216,7 @@ fn apply_before(
     if st.state != from || agent.active_holds(&st)? != holds_before {
         ops::refresh_display(agent, &st);
     }
-    Ok(Some(logged))
+    Ok(Outcome::Applied(logged))
 }
 
 /// Match a submitted prompt against tmac's input; otherwise treat it as a

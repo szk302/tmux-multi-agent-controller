@@ -1,14 +1,22 @@
 #!/usr/bin/env -S python3 -I
-"""A fake AI CLI for tests. It reads the hooks tmac passes (claude:
---settings FILE, codex: -c hooks.EVENT=...), reads keys from its terminal
+"""A fake AI CLI for tests. Run it as `claude` or `codex` (a link with that
+name). Like the real CLIs, it reads hooks from the user's settings (claude:
+$CLAUDE_CONFIG_DIR/settings.json, codex: $CODEX_HOME/hooks.json), the
+project's settings and the caller's arguments (claude: --settings, codex:
+-c hooks.EVENT=...), runs them with the shell, reads keys from its terminal
 like a TUI with bracketed paste, and fires hooks the way the real CLIs do.
 
 Prompts it understands:
   busy N    work for N seconds (PreToolUse ... PostToolUse)
   ask       wait for approval: PermissionRequest, then the key "y"
+  nested    like a CLI started by the agent's tool: hooks of another session
+            and of the other driver fire while the agent works
   crash     exit with status 3 without SessionEnd
-  /exit /quit   SessionEnd, then exit 0
+  /clear    start a new session (claude: SessionEnd and SessionStart now;
+            codex: SessionStart before the next prompt, no SessionEnd)
+  /exit /quit   SessionEnd, then exit 0 (codex: also for earlier sessions)
 Anything else is answered at once. ESC (alone) interrupts (codex: Interrupt).
+Slash commands do not fire UserPromptSubmit.
 
 Environment:
   FAKE_LOG               file to append events to (one JSON object per line)
@@ -24,6 +32,7 @@ import termios
 import time
 import tomllib
 import tty
+import uuid
 
 LOG = os.environ.get("FAKE_LOG")
 
@@ -34,55 +43,79 @@ def log(**kw):
             f.write(json.dumps(kw, ensure_ascii=False) + "\n")
 
 
-def parse_hooks(argv):
-    """Return (mode, {event: [command, ...]}, positional args)."""
-    hooks, rest, mode = {}, [], None
+def add_hooks(hooks, obj):
+    for ev, groups in (obj or {}).items():
+        for g in groups:
+            for h in g.get("hooks", [g]):
+                if "command" in h:
+                    hooks.setdefault(ev, []).append(h["command"])
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def parse_hooks(mode, argv):
+    """Return ({event: [command, ...]}, positional args)."""
+    hooks, rest = {}, []
+    if mode == "claude":
+        add_hooks(hooks, read_json(os.path.join(os.environ.get(
+            "CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude")), "settings.json")).get("hooks"))
+        for name in ("settings.json", "settings.local.json"):
+            add_hooks(hooks, read_json(os.path.join(".claude", name)).get("hooks"))
+    else:
+        add_hooks(hooks, read_json(os.path.join(os.environ.get(
+            "CODEX_HOME", os.path.expanduser("~/.codex")), "hooks.json")).get("hooks"))
+        add_hooks(hooks, read_json(os.path.join(".codex", "hooks.json")).get("hooks"))
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a == "--settings":
-            mode = "claude"
-            with open(argv[i + 1], encoding="utf-8") as f:
-                settings = json.load(f)
-            for ev, groups in settings.get("hooks", {}).items():
-                for g in groups:
-                    for h in g.get("hooks", []):
-                        hooks.setdefault(ev, []).append(h["command"])
+        if a == "--settings" and mode == "claude":
+            v = argv[i + 1]
+            add_hooks(hooks, (json.loads(v) if v.lstrip().startswith("{")
+                              else read_json(v)).get("hooks"))
             i += 2
             continue
-        if a == "-c":
+        if a == "-c" and mode == "codex":
             key, _, value = argv[i + 1].partition("=")
             if key.startswith("hooks."):
-                mode = "codex"
-                ev = key[len("hooks."):]
-                for g in tomllib.loads("v = " + value)["v"]:
-                    for h in g.get("hooks", []):
-                        hooks.setdefault(ev, []).append(h["command"])
+                add_hooks(hooks, {key[len("hooks."):]: tomllib.loads("v = " + value)["v"]})
             i += 2
             continue
         rest.append(a)
         i += 1
-    return mode, hooks, rest
+    return hooks, rest
 
 
-MODE, HOOKS, POSITIONAL = parse_hooks(sys.argv[1:])
+MODE = os.path.basename(sys.argv[0])
+HOOKS, POSITIONAL = parse_hooks(MODE, sys.argv[1:])
+SESSION = str(uuid.uuid4())
+OLD_SESSIONS = []
 
 
-def fire(event, **payload):
+def run_hook(cmd, payload):
+    p = subprocess.run(cmd, shell=True, input=json.dumps(payload).encode(),
+                       stdout=subprocess.PIPE)
+    return p.returncode, p.stdout.decode(errors="replace").strip()
+
+
+def fire(event, session=None, **payload):
     """Run the hooks of an event. Returns True if one blocked."""
-    payload = {"hook_event_name": event, "session_id": "fake", **payload}
+    payload = {"hook_event_name": event, "session_id": session or SESSION, **payload}
     blocked = False
     for cmd in HOOKS.get(event, []):
-        p = subprocess.run(cmd, shell=True, input=json.dumps(payload).encode(),
-                           stdout=subprocess.PIPE)
-        out = p.stdout.decode(errors="replace").strip()
+        code, out = run_hook(cmd, payload)
         decision = None
         try:
             decision = json.loads(out).get("decision") if out else None
         except (ValueError, AttributeError):
             pass
-        b = p.returncode == 2 or (p.returncode == 0 and decision == "block")
-        log(event=event, code=p.returncode, out=out, blocked=b)
+        b = code == 2 or (code == 0 and decision == "block")
+        log(event=event, code=code, out=out, blocked=b, session=payload["session_id"])
         blocked |= b
     return blocked
 
@@ -168,8 +201,19 @@ def main():
                 return "key"
         return "timeout"
 
+    pending_start = [None]
+
+    def new_session():
+        global SESSION
+        OLD_SESSIONS.append(SESSION)
+        SESSION = str(uuid.uuid4())
+
     def run_turn(prompt):
-        if os.environ.get("FAKE_NO_PROMPT_HOOK") != "1":
+        if pending_start[0]:
+            fire("SessionStart", source=pending_start[0])
+            pending_start[0] = None
+        slash = prompt.startswith("/")
+        if os.environ.get("FAKE_NO_PROMPT_HOOK") != "1" and not slash:
             if fire("UserPromptSubmit", prompt=prompt):
                 log(event="rejected", prompt=prompt)
                 return
@@ -177,10 +221,23 @@ def main():
         say(f"\r\n> {prompt}\r\n")
         words = prompt.split()
         if prompt in ("/exit", "/quit"):
+            if MODE == "codex":
+                for s in OLD_SESSIONS:
+                    fire("SessionEnd", session=s, reason="other")
             fire("SessionEnd", reason="prompt_input_exit")
             log(event="exit")
             term.restore()
             sys.exit(0)
+        if prompt == "/clear":
+            if MODE == "codex":
+                new_session()
+                pending_start[0] = "clear"
+            else:
+                fire("SessionEnd", reason="clear")
+                new_session()
+                fire("SessionStart", source="clear")
+            log(event="cleared", session=SESSION)
+            return
         if words[:1] == ["crash"]:
             log(event="crash")
             term.restore()
@@ -190,6 +247,18 @@ def main():
             if wait_for_key(None, float(words[1])) == "esc":
                 interrupted()
                 return
+            fire("PostToolUse", tool_name="Bash")
+        if words[:1] == ["nested"]:
+            fire("PreToolUse", tool_name="Bash")
+            # A CLI the tool started: same driver, another session ...
+            fire("SessionStart", session="nested", source="startup")
+            fire("Stop", session="nested", stop_hook_active=False)
+            # ... and the other driver, with the agent's environment.
+            other = "codex" if MODE == "claude" else "claude"
+            code, _ = run_hook(f"command -v tmac >/dev/null 2>&1 || exit 0; "
+                               f"exec tmac hook {other} Stop",
+                               {"hook_event_name": "Stop", "session_id": "other"})
+            log(event="nested", code=code)
             fire("PostToolUse", tool_name="Bash")
         if words[:1] == ["selfnote"]:
             # Like Claude Code delivering a background task notice mid-turn.

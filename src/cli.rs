@@ -41,6 +41,39 @@ pub enum Cmd {
     List(ListCli),
     /// End an agent and remove its pane and record
     Kill(KillCli),
+    /// Check that agents can be started: tmac's hooks, other hooks, PATH
+    Doctor(DoctorCli),
+    /// Install tmac's hooks for the user
+    #[command(subcommand)]
+    Hooks(HooksCmd),
+}
+
+#[derive(Args, Debug)]
+pub struct DoctorCli {
+    /// Drivers to check (default: all)
+    pub drivers: Vec<String>,
+    /// Directory whose project settings to check (default: the current directory)
+    #[arg(short = 'C', long)]
+    pub cwd: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HooksCmd {
+    /// Write rulesync sources (hooks.jsonc, rulesync.jsonc) for tmac's hooks
+    Rulesync(RulesyncCli),
+}
+
+#[derive(Args, Debug)]
+pub struct RulesyncCli {
+    /// Directory to write to
+    pub dir: PathBuf,
+    /// Your own hooks.jsonc to include (rulesync manages the user's hooks
+    /// from one source)
+    #[arg(long, value_name = "FILE")]
+    pub merge: Option<PathBuf>,
+    /// Another rulesync target to generate (for the hooks of --merge)
+    #[arg(long, value_name = "TARGET")]
+    pub target: Vec<String>,
 }
 
 #[derive(Args, Debug)]
