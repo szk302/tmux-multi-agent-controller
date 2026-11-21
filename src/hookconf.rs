@@ -3,7 +3,8 @@
 //!
 //! tmac does not write the CLIs' settings. Its hooks are installed once for
 //! the user (with rulesync, `tmac hooks rulesync`), and `spawn` and
-//! `tmac doctor` read the settings to check them.
+//! `tmac doctor` read the settings to check them. Where to look comes from
+//! the driver (`hooks.places`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use std::process::Command;
 
 use serde_json::Value;
 
-use crate::driver::{BLOCKING_EVENTS, Driver};
+use crate::driver::{ArgFormat, BLOCKING_EVENTS, Driver, FileFormat, Place};
 use crate::error::{Error, Result};
 
 /// One hook command found in a place.
@@ -28,11 +29,8 @@ pub struct Found {
 
 /// The guarded command tmac's hooks run (§5.5): it does nothing where tmac
 /// is not installed.
-pub fn hook_command(driver: Driver, event: &str) -> String {
-    format!(
-        "command -v tmac >/dev/null 2>&1 || exit 0; exec tmac hook {} {event}",
-        driver.name()
-    )
+pub fn hook_command(driver: &str, event: &str) -> String {
+    format!("command -v tmac >/dev/null 2>&1 || exit 0; exec tmac hook {driver} {event}")
 }
 
 /// The driver and event of a hook command that runs `tmac hook`, if it is
@@ -52,6 +50,70 @@ pub fn tmac_hook_target(command: &str) -> Option<(String, String)> {
     match rest {
         [driver, event] => Some(((*driver).to_string(), (*event).to_string())),
         _ => None,
+    }
+}
+
+/// Values for expanding the places: environment variables, and whether to
+/// read system-wide files.
+#[derive(Debug, Clone)]
+pub struct Lookup {
+    /// `None`: the process environment.
+    vars: Option<BTreeMap<String, String>>,
+    pub system: bool,
+}
+
+impl Lookup {
+    pub fn from_env() -> Lookup {
+        Lookup {
+            vars: None,
+            system: true,
+        }
+    }
+
+    /// Fixed variables and no system-wide files (for tests).
+    pub fn with_vars(vars: &[(&str, &str)]) -> Lookup {
+        Lookup {
+            vars: Some(
+                vars.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+            system: false,
+        }
+    }
+
+    fn var(&self, key: &str) -> Option<String> {
+        let v = match &self.vars {
+            Some(m) => m.get(key).cloned(),
+            None => std::env::var(key).ok(),
+        };
+        v.filter(|v| !v.is_empty())
+    }
+
+    /// Expand `${VAR}`, `${VAR:-default}` and a leading `~/`. `None` if a
+    /// variable without a default is not set.
+    pub fn expand(&self, text: &str) -> Option<String> {
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(at) = rest.find("${") {
+            out.push_str(&rest[..at]);
+            let end = rest[at..].find('}')? + at;
+            let inner = &rest[at + 2..end];
+            let (name, default) = match inner.split_once(":-") {
+                Some((n, d)) => (n, Some(d)),
+                None => (inner, None),
+            };
+            match self.var(name) {
+                Some(v) => out.push_str(&v),
+                None => out.push_str(default?),
+            }
+            rest = &rest[end + 1..];
+        }
+        out.push_str(rest);
+        if let Some(tail) = out.strip_prefix("~/") {
+            return Some(format!("{}/{tail}", self.var("HOME")?));
+        }
+        Some(out)
     }
 }
 
@@ -108,208 +170,194 @@ fn git_toplevel(dir: &Path) -> Option<PathBuf> {
         .then(|| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
 }
 
-fn env_dir(var: &str, default_in_home: &str) -> Option<PathBuf> {
-    std::env::var_os(var)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|v| !v.is_empty())
-                .map(|h| PathBuf::from(h).join(default_in_home))
-        })
-}
-
-/// Directories of the CLIs' settings.
-#[derive(Debug, Clone)]
-pub struct Dirs {
-    /// `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
-    pub claude_config: Option<PathBuf>,
-    /// `$CODEX_HOME`, else `~/.codex`.
-    pub codex_home: Option<PathBuf>,
-    /// Whether to read the system-wide settings (`/etc/...`).
-    pub system: bool,
-}
-
-impl Dirs {
-    pub fn from_env() -> Dirs {
-        Dirs {
-            claude_config: env_dir("CLAUDE_CONFIG_DIR", ".claude"),
-            codex_home: env_dir("CODEX_HOME", ".codex"),
-            system: true,
-        }
-    }
-}
-
-/// Index of the CLI in the command: the first argument named like the
-/// driver (so wrappers such as `env` or `mise exec --` keep working), or 0.
-fn cli_index(command: &[String], driver: Driver) -> usize {
+/// Index of the CLI in the command: the first argument named like one of
+/// the driver's commands (so wrappers such as `env` or `mise exec --` keep
+/// working), or 0.
+fn cli_index(command: &[String], driver: &Driver) -> usize {
     command
         .iter()
-        .position(|a| Path::new(a).file_name().is_some_and(|n| n == driver.name()))
+        .position(|a| {
+            Path::new(a)
+                .file_name()
+                .is_some_and(|n| driver.commands().iter().any(|c| n == c.as_str()))
+        })
         .unwrap_or(0)
 }
 
-/// Every hook command the CLI would run for an agent in `cwd` started with
-/// `command`.
-pub fn find(driver: Driver, dirs: &Dirs, cwd: &Path, command: &[String]) -> Result<Vec<Found>> {
-    let args = match command.get(cli_index(command, driver) + 1..) {
-        Some(a) => a,
-        None => &[],
-    };
-    match driver {
-        Driver::Claude => find_claude(dirs, cwd, args),
-        Driver::Codex => Ok(find_codex(dirs, cwd, args)),
+/// Directories a file place covers: `{project}` is the working directory
+/// and the git root; `{project_layers}` is each directory from the git root
+/// down to the working directory.
+fn expand_dirs(path: &str, cwd: &Path) -> Vec<PathBuf> {
+    let top = git_toplevel(cwd);
+    let sub =
+        |dir: &Path, marker: &str| PathBuf::from(path.replacen(marker, &dir.to_string_lossy(), 1));
+    if path.contains("{project}") {
+        let mut dirs = vec![cwd.to_path_buf()];
+        if let Some(t) = top.filter(|t| t != cwd) {
+            dirs.push(t);
+        }
+        return dirs.iter().map(|d| sub(d, "{project}")).collect();
     }
+    if path.contains("{project_layers}") {
+        let top = top.unwrap_or_else(|| cwd.to_path_buf());
+        let mut layers = Vec::new();
+        let mut d = cwd.to_path_buf();
+        loop {
+            layers.push(d.clone());
+            if d == top || !d.pop() {
+                break;
+            }
+        }
+        layers.reverse();
+        return layers.iter().map(|d| sub(d, "{project_layers}")).collect();
+    }
+    vec![PathBuf::from(path)]
 }
 
-/// The caller's `--settings` value, if any.
-fn settings_arg(args: &[String]) -> Option<&str> {
-    let mut value = None;
+/// Values of an option in the arguments (`--name VALUE` or `--name=VALUE`).
+fn arg_values<'a>(args: &'a [String], names: &[String]) -> Vec<&'a str> {
+    let mut out = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--settings" && i + 1 < args.len() {
-            value = Some(args[i + 1].as_str());
+        let a = &args[i];
+        if names.iter().any(|n| n == a) && i + 1 < args.len() {
+            out.push(args[i + 1].as_str());
             i += 2;
             continue;
         }
-        if let Some(v) = args[i].strip_prefix("--settings=") {
-            value = Some(v);
+        if let Some((k, v)) = a.split_once('=')
+            && k.starts_with("--")
+            && names.iter().any(|n| n == k)
+        {
+            out.push(v);
         }
         i += 1;
     }
-    value
+    out
 }
 
-fn find_claude(dirs: &Dirs, cwd: &Path, args: &[String]) -> Result<Vec<Found>> {
+/// Every hook command the CLI would run for an agent in `cwd` started with
+/// `command`, from the driver's places.
+pub fn find(
+    driver: &Driver,
+    lookup: &Lookup,
+    cwd: &Path,
+    command: &[String],
+) -> Result<Vec<Found>> {
+    let args = command.get(cli_index(command, driver) + 1..).unwrap_or(&[]);
+    let os = if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    };
     let mut found = Vec::new();
-    let config_dir = dirs.claude_config.clone();
-    let mut files = Vec::new();
-    if let Some(d) = &config_dir {
-        files.push(d.join("settings.json"));
-    }
-    let mut project_dirs = vec![cwd.to_path_buf()];
-    if let Some(top) = git_toplevel(cwd).filter(|t| t != cwd) {
-        project_dirs.push(top);
-    }
-    for d in &project_dirs {
-        files.push(d.join(".claude/settings.json"));
-        files.push(d.join(".claude/settings.local.json"));
-    }
-    if dirs.system {
-        files.push(PathBuf::from(if cfg!(target_os = "macos") {
-            "/Library/Application Support/ClaudeCode/managed-settings.json"
-        } else {
-            "/etc/claude-code/managed-settings.json"
-        }));
-    }
+    // `enabledPlugins` of the settings files read so far (Claude Code).
     let mut enabled: BTreeMap<String, bool> = BTreeMap::new();
-    for f in &files {
-        let Some(v) = read_json(f) else { continue };
-        collect(&f.display().to_string(), v.get("hooks"), &mut found);
-        if let Some(p) = v.get("enabledPlugins").and_then(Value::as_object) {
-            for (k, on) in p {
-                enabled.insert(k.clone(), on.as_bool().unwrap_or(false));
-            }
-        }
-    }
-    if let Some(v) = settings_arg(args) {
-        let parsed: Value = if v.trim_start().starts_with('{') {
-            serde_json::from_str(v)
-                .map_err(|e| Error::usage(format!("cannot parse --settings JSON: {e}")))?
-        } else {
-            let path = cwd.join(v);
-            let text = std::fs::read_to_string(&path).map_err(|e| {
-                Error::usage(format!("cannot read --settings {}: {e}", path.display()))
-            })?;
-            serde_json::from_str(&text)
-                .map_err(|e| Error::usage(format!("cannot parse {}: {e}", path.display())))?
-        };
-        collect("--settings", parsed.get("hooks"), &mut found);
-    }
-    // Hooks of enabled plugins: <installPath>/hooks/hooks.json.
-    if let Some(d) = &config_dir
-        && let Some(installed) = read_json(&d.join("plugins/installed_plugins.json"))
-    {
-        for (plugin, _) in enabled.iter().filter(|(_, on)| **on) {
-            let entries = installed
-                .get("plugins")
-                .and_then(|p| p.get(plugin))
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            for e in entries {
-                let Some(path) = e.get("installPath").and_then(Value::as_str) else {
+    for place in driver.places() {
+        match place {
+            Place::File {
+                path,
+                format,
+                key,
+                os: only,
+                system,
+            } => {
+                if (*system && !lookup.system) || only.as_deref().is_some_and(|o| o != os) {
+                    continue;
+                }
+                let Some(path) = lookup.expand(path) else {
                     continue;
                 };
-                let file = Path::new(path).join("hooks/hooks.json");
-                if let Some(v) = read_json(&file) {
-                    let hooks = v.get("hooks").or(Some(&v));
-                    collect(
-                        &format!("plugin {plugin} ({})", file.display()),
-                        hooks,
-                        &mut found,
-                    );
+                for file in expand_dirs(&path, cwd) {
+                    let v = match format {
+                        FileFormat::Json => read_json(&file),
+                        FileFormat::Toml => read_toml(&file),
+                    };
+                    let Some(v) = v else { continue };
+                    collect(&file.display().to_string(), v.get(key), &mut found);
+                    if let Some(p) = v.get("enabledPlugins").and_then(Value::as_object) {
+                        for (k, on) in p {
+                            enabled.insert(k.clone(), on.as_bool().unwrap_or(false));
+                        }
+                    }
+                }
+            }
+            Place::Arg { names, format, key } => {
+                for value in arg_values(args, names) {
+                    match format {
+                        ArgFormat::Json => {
+                            let parsed: Value = if value.trim_start().starts_with('{') {
+                                serde_json::from_str(value).map_err(|e| {
+                                    Error::usage(format!("cannot parse {} JSON: {e}", names[0]))
+                                })?
+                            } else {
+                                let path = cwd.join(value);
+                                let text = std::fs::read_to_string(&path).map_err(|e| {
+                                    Error::usage(format!(
+                                        "cannot read {} {}: {e}",
+                                        names[0],
+                                        path.display()
+                                    ))
+                                })?;
+                                serde_json::from_str(&text).map_err(|e| {
+                                    Error::usage(format!("cannot parse {}: {e}", path.display()))
+                                })?
+                            };
+                            collect(&names[0], parsed.get(key), &mut found);
+                        }
+                        ArgFormat::TomlAssign => {
+                            if let Some((k, v)) = value.split_once('=')
+                                && let Some(event) = k
+                                    .trim()
+                                    .strip_prefix(key.as_str())
+                                    .and_then(|r| r.strip_prefix('.'))
+                                && let Ok(t) = format!("v = {v}").parse::<toml::Table>()
+                                && let Ok(v) = serde_json::to_value(&t["v"])
+                            {
+                                let mut hooks = serde_json::Map::new();
+                                hooks.insert(event.to_string(), v);
+                                collect("command line", Some(&Value::Object(hooks)), &mut found);
+                            }
+                        }
+                    }
+                }
+            }
+            Place::ClaudePlugins { dir } => {
+                let Some(dir) = lookup.expand(dir) else {
+                    continue;
+                };
+                let Some(installed) =
+                    read_json(&Path::new(&dir).join("plugins/installed_plugins.json"))
+                else {
+                    continue;
+                };
+                // Hooks of enabled plugins: <installPath>/hooks/hooks.json.
+                for (plugin, _) in enabled.iter().filter(|(_, on)| **on) {
+                    let entries = installed
+                        .get("plugins")
+                        .and_then(|p| p.get(plugin))
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    for e in entries {
+                        let Some(path) = e.get("installPath").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let file = Path::new(path).join("hooks/hooks.json");
+                        if let Some(v) = read_json(&file) {
+                            let hooks = v.get("hooks").or(Some(&v));
+                            collect(
+                                &format!("plugin {plugin} ({})", file.display()),
+                                hooks,
+                                &mut found,
+                            );
+                        }
+                    }
                 }
             }
         }
     }
     Ok(found)
-}
-
-fn find_codex(where_: &Dirs, cwd: &Path, args: &[String]) -> Vec<Found> {
-    let mut found = Vec::new();
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if where_.system {
-        dirs.push(PathBuf::from("/etc/codex"));
-    }
-    if let Some(h) = &where_.codex_home {
-        dirs.push(h.clone());
-    }
-    // Project layers from the project root down to the working directory.
-    let top = git_toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf());
-    let mut layer = Vec::new();
-    let mut d = cwd.to_path_buf();
-    loop {
-        layer.push(d.join(".codex"));
-        if d == top || !d.pop() {
-            break;
-        }
-    }
-    layer.reverse();
-    dirs.extend(layer);
-    for d in &dirs {
-        let hooks_json = d.join("hooks.json");
-        if let Some(v) = read_json(&hooks_json) {
-            collect(
-                &hooks_json.display().to_string(),
-                v.get("hooks"),
-                &mut found,
-            );
-        }
-        let config = d.join("config.toml");
-        if let Some(v) = read_toml(&config) {
-            collect(&config.display().to_string(), v.get("hooks"), &mut found);
-        }
-    }
-    // The caller's own -c hooks.EVENT=VALUE overrides.
-    let mut i = 0;
-    while i + 1 < args.len() {
-        if args[i] == "-c" || args[i] == "--config" {
-            if let Some((key, value)) = args[i + 1].split_once('=')
-                && let Some(event) = key.trim().strip_prefix("hooks.")
-                && let Ok(t) = format!("v = {value}").parse::<toml::Table>()
-                && let Ok(v) = serde_json::to_value(&t["v"])
-            {
-                let mut hooks = serde_json::Map::new();
-                hooks.insert(event.to_string(), v);
-                collect("command line", Some(&Value::Object(hooks)), &mut found);
-            }
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    found
 }
 
 /// The result of checking the hooks for a driver (§5.6).
@@ -326,8 +374,8 @@ pub struct Check {
 }
 
 impl Check {
-    pub fn run(driver: Driver, dirs: &Dirs, cwd: &Path, command: &[String]) -> Result<Check> {
-        let found = find(driver, dirs, cwd, command)?;
+    pub fn run(driver: &Driver, lookup: &Lookup, cwd: &Path, command: &[String]) -> Result<Check> {
+        let found = find(driver, lookup, cwd, command)?;
         let mut tmac: BTreeMap<String, Vec<Found>> = driver
             .events()
             .iter()
@@ -357,7 +405,7 @@ impl Check {
             }
         }
         Ok(Check {
-            driver,
+            driver: driver.clone(),
             tmac,
             foreign,
             tmac_on_path: which("tmac"),
@@ -365,24 +413,23 @@ impl Check {
     }
 
     /// Events without tmac's hook, in the driver's order.
-    pub fn missing(&self) -> Vec<&'static str> {
+    pub fn missing(&self) -> Vec<String> {
         self.driver
             .events()
-            .iter()
-            .copied()
+            .into_iter()
             .filter(|e| self.tmac.get(*e).is_none_or(Vec::is_empty))
+            .map(str::to_string)
             .collect()
     }
 
     /// Events with tmac's hook more than once, and their places.
-    pub fn duplicated(&self) -> Vec<(&'static str, Vec<&str>)> {
+    pub fn duplicated(&self) -> Vec<(String, Vec<&str>)> {
         self.driver
             .events()
-            .iter()
-            .copied()
+            .into_iter()
             .filter_map(|e| {
                 let l = self.tmac.get(e)?;
-                (l.len() > 1).then(|| (e, l.iter().map(|f| f.place.as_str()).collect()))
+                (l.len() > 1).then(|| (e.to_string(), l.iter().map(|f| f.place.as_str()).collect()))
             })
             .collect()
     }
@@ -434,12 +481,30 @@ check with `tmac doctor`";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::Source;
+
+    fn builtin(name: &str) -> Driver {
+        let text = match name {
+            "claude" => include_str!("../drivers/claude.yaml"),
+            _ => include_str!("../drivers/codex.yaml"),
+        };
+        Driver::parse(name, Source::Builtin, text).unwrap()
+    }
+
+    fn lookup(root: &Path) -> Lookup {
+        let (claude, codex) = (root.join("claude"), root.join("codex"));
+        Lookup::with_vars(&[
+            ("HOME", root.to_str().unwrap()),
+            ("CLAUDE_CONFIG_DIR", claude.to_str().unwrap()),
+            ("CODEX_HOME", codex.to_str().unwrap()),
+        ])
+    }
 
     #[test]
     fn tmac_hook_commands() {
         let t = |c: &str| tmac_hook_target(c).map(|(d, e)| format!("{d} {e}"));
         assert_eq!(
-            t(&hook_command(Driver::Claude, "Stop")).as_deref(),
+            t(&hook_command("claude", "Stop")).as_deref(),
             Some("claude Stop")
         );
         assert_eq!(
@@ -455,12 +520,13 @@ mod tests {
         assert_eq!(t("tmac hook claude"), None);
     }
 
-    fn test_dirs(root: &Path) -> Dirs {
-        Dirs {
-            claude_config: Some(root.join("claude")),
-            codex_home: Some(root.join("codex")),
-            system: false,
-        }
+    #[test]
+    fn expansion() {
+        let l = Lookup::with_vars(&[("HOME", "/h"), ("A", "/a")]);
+        assert_eq!(l.expand("${A:-~/x}/s.json").as_deref(), Some("/a/s.json"));
+        assert_eq!(l.expand("${B:-~/x}/s.json").as_deref(), Some("/h/x/s.json"));
+        assert_eq!(l.expand("${B}/s.json"), None);
+        assert_eq!(l.expand("/etc/x").as_deref(), Some("/etc/x"));
     }
 
     fn write(path: &Path, text: &str) {
@@ -476,18 +542,21 @@ mod tests {
             &cwd.join(".codex/hooks.json"),
             &format!(
                 r#"{{"hooks":{{"Stop":[{{"hooks":[{{"type":"command","command":"{}","timeout":30}}]}}]}}}}"#,
-                hook_command(Driver::Codex, "Stop")
+                hook_command("codex", "Stop")
             ),
         );
         write(
             &cwd.join(".codex/config.toml"),
             "[[hooks.UserPromptSubmit]]\nhooks = [{ type = \"command\", command = \"guard\" }]\n",
         );
-        let args = vec![
-            "-c".to_string(),
-            "hooks.Stop=[{hooks=[{type=\"command\",command=\"other\"}]}]".to_string(),
-        ];
-        let found = find_codex(&test_dirs(t.path()), &cwd, &args);
+        let cmd: Vec<String> = [
+            "codex",
+            "-c",
+            "hooks.Stop=[{hooks=[{type=\"command\",command=\"other\"}]}]",
+        ]
+        .map(String::from)
+        .to_vec();
+        let found = find(&builtin("codex"), &lookup(t.path()), &cwd, &cmd).unwrap();
         let cmds: Vec<(&str, &str)> = found
             .iter()
             .map(|f| (f.event.as_str(), f.command.as_str()))
@@ -506,13 +575,14 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let cwd = t.path().join("work");
         std::fs::create_dir_all(&cwd).unwrap();
+        let claude = builtin("claude");
         let hooks = |events: &[&str], extra: &str| {
             let mut m = serde_json::Map::new();
             for e in events {
                 m.insert(
                     e.to_string(),
                     serde_json::json!([{"hooks": [{"type": "command",
-                        "command": hook_command(Driver::Claude, e), "timeout": 30}]}]),
+                        "command": hook_command("claude", e), "timeout": 30}]}]),
                 );
             }
             let mut v = serde_json::json!({"hooks": m});
@@ -526,13 +596,13 @@ mod tests {
         };
         write(
             &cwd.join(".claude/settings.json"),
-            &hooks(Driver::Claude.events(), "lmm hook"),
+            &hooks(&claude.events(), "lmm hook"),
         );
         let settings = hooks(&["Stop"], "");
         let cmd: Vec<String> = ["claude", "--settings", settings.as_str()]
             .map(String::from)
             .to_vec();
-        let c = Check::run(Driver::Claude, &test_dirs(t.path()), &cwd, &cmd).unwrap();
+        let c = Check::run(&claude, &lookup(t.path()), &cwd, &cmd).unwrap();
         assert!(c.missing().is_empty());
         let dup = c.duplicated();
         assert_eq!(dup.len(), 1);
@@ -545,5 +615,34 @@ mod tests {
             "30 s is enough for a 20 s relay"
         );
         assert_eq!(c.short_timeouts(["Stop"].into_iter(), 25.0).len(), 2);
+    }
+
+    #[test]
+    fn plugins_of_claude() {
+        let t = tempfile::tempdir().unwrap();
+        let cwd = t.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let plugin = t.path().join("plugin");
+        write(
+            &plugin.join("hooks/hooks.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"review"}]}]}}"#,
+        );
+        write(
+            &t.path().join("claude/settings.json"),
+            r#"{"enabledPlugins":{"p@m":true}}"#,
+        );
+        write(
+            &t.path().join("claude/plugins/installed_plugins.json"),
+            &serde_json::json!({"plugins": {"p@m": [{"installPath": plugin}]}}).to_string(),
+        );
+        let found = find(
+            &builtin("claude"),
+            &lookup(t.path()),
+            &cwd,
+            &["claude".into()],
+        )
+        .unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].place.starts_with("plugin p@m ("));
     }
 }

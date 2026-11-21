@@ -622,3 +622,53 @@ fn session_changes_with_clear() {
         assert!(env.events("s1").iter().any(|e| e["event"] == "exit"));
     }
 }
+
+#[test]
+fn driver_files_are_listed_shown_and_checked() {
+    let env = Env::new();
+    let list = env.ok(&["driver", "list"]);
+    assert!(list.contains("claude\t"), "{list}");
+    assert!(list.contains("(replaces the built-in one)"), "{list}");
+    let shown = env.ok(&["driver", "show", "codex"]);
+    assert!(shown.contains("submit_delay_ms: 100"), "{shown}");
+    assert!(env.ok(&["driver", "check"]).contains("claude: ok"));
+    // A broken file is reported, and spawn refuses to use it.
+    let bad = env.home.join("drivers/broken.yaml");
+    std::fs::write(&bad, "version: 1\nevents:\n  P: {role: prompt}\n").unwrap();
+    let out = env.tmac(&["driver", "check", "broken"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("an event must have role: stop"),
+        "{out:?}"
+    );
+    env.expect(&["driver", "check", bad.to_str().unwrap()], 2);
+    env.expect(&["driver", "show", "nope"], 2);
+}
+
+#[test]
+fn a_new_cli_runs_with_a_users_driver() {
+    // "mycli": a CLI the built-in drivers do not know, described in YAML.
+    // (The fake CLI acts like Claude Code and, under this name, reads its
+    // hooks from $CODEX_HOME/hooks.json.)
+    let env = Env::new();
+    let yaml = common::CLAUDE_YAML
+        .replace("commands: [claude]", "commands: [mycli]")
+        .replace(
+            "  places:\n",
+            "  places:\n    - {file: \"${CODEX_HOME:-~/.codex}/hooks.json\", format: json}\n",
+        );
+    std::fs::write(env.home.join("drivers/mycli.yaml"), yaml).unwrap();
+    std::fs::write(
+        env.codex_dir().join("hooks.json"),
+        common::hooks_json("mycli", common::CLAUDE_EVENTS, 30).to_string(),
+    )
+    .unwrap();
+    let out = env.spawn("m1", "mycli", &[], &[]);
+    assert!(out.starts_with("work-dir/m1 %"), "{out}");
+    assert_eq!(env.field("m1", "driver"), "mycli");
+    env.ok(&["send", "m1", "hello"]);
+    env.ok(&["wait", "m1", "--timeout", "10"]);
+    assert_eq!(env.prompts("m1"), ["hello"]);
+    env.ok(&["kill", "m1"]);
+    assert!(env.events("m1").iter().any(|e| e["event"] == "exit"));
+}

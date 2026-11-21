@@ -8,7 +8,7 @@ use crate::config;
 use crate::driver::Driver;
 use crate::error::{Error, Result};
 use crate::home::Home;
-use crate::hookconf::{self, Check, Dirs};
+use crate::hookconf::{self, Check, Lookup};
 use crate::ops;
 use crate::project::{self, AgentRef};
 use crate::record::{self, Agent, AgentFile, State, TmuxInfo};
@@ -43,13 +43,13 @@ pub fn run(a: SpawnArgs) -> Result<()> {
     if a.command.is_empty() {
         return Err(Error::usage("give the command after --"));
     }
+    let home = Home::resolve()?;
     let driver = match &a.driver {
-        Some(d) => {
-            Driver::from_name(d).ok_or_else(|| Error::usage(format!("unknown driver {d:?}")))?
-        }
-        None => Driver::from_command(&a.command[0]).ok_or_else(|| {
+        Some(d) => Driver::load(&home, d)?,
+        None => Driver::from_command(&home, &a.command[0])?.ok_or_else(|| {
+            let names = Driver::names(&home).unwrap_or_default().join(", ");
             Error::usage(format!(
-                "cannot tell the driver from {:?}; pass --driver claude or --driver codex",
+                "cannot tell the driver from {:?}; pass --driver (drivers: {names})",
                 a.command[0]
             ))
         })?,
@@ -89,7 +89,6 @@ pub fn run(a: SpawnArgs) -> Result<()> {
         env_pairs.push((k.clone(), v));
     }
 
-    let home = Home::resolve()?;
     let cfg = config::load(&home)?;
     let mut relay: BTreeMap<String, String> =
         cfg.relay.get(driver.name()).cloned().unwrap_or_default();
@@ -129,7 +128,7 @@ pub fn run(a: SpawnArgs) -> Result<()> {
     }
 
     check_hooks(
-        driver,
+        &driver,
         &cwd,
         &a.command,
         &relay,
@@ -229,14 +228,14 @@ pub fn run(a: SpawnArgs) -> Result<()> {
 /// once for every event, `tmac` in PATH, time limits long enough for the
 /// relays, and no other hooks that can block.
 fn check_hooks(
-    driver: Driver,
+    driver: &Driver,
     cwd: &std::path::Path,
     command: &[String],
     relay: &BTreeMap<String, String>,
     cfg: &config::Config,
     allow_foreign: bool,
 ) -> Result<()> {
-    let c = Check::run(driver, &Dirs::from_env(), cwd, command)?;
+    let c = Check::run(driver, &Lookup::from_env(), cwd, command)?;
     let missing = c.missing();
     if !missing.is_empty() {
         return Err(Error::usage(format!(

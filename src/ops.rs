@@ -126,6 +126,7 @@ pub fn attempt_input(
     let key = agent.key();
     let name = key.to_string();
     let instance = agent.instance();
+    let submit_delay = Driver::load(&agent.home, &agent.info.driver)?.submit_delay_ms();
     let _input_lock = agent
         .home
         .lock(&key, LockKind::Input, lock_wait, Some(sig))?;
@@ -192,9 +193,7 @@ pub fn attempt_input(
     }
     // From paste to Enter, signals do not interrupt (the flag is only read
     // afterwards), so the text is never left alone in the input box.
-    let driver = Driver::from_name(&agent.info.driver).unwrap_or(Driver::Claude);
-    let delay = cfg.submit_delay(driver.name(), driver.submit_delay_default_ms());
-    thread::sleep(Duration::from_millis(delay));
+    thread::sleep(Duration::from_millis(submit_delay));
     let entered = tmux.send_key_tagged(&pane.id, instance, "Enter");
     if !matches!(entered, Ok(true)) {
         let _g = agent.home.state_lock(&key)?;

@@ -34,6 +34,9 @@ pub fn fake_as(env: &Env, driver: &str) -> PathBuf {
     link
 }
 
+pub const CLAUDE_YAML: &str = include_str!("../../drivers/claude.yaml");
+pub const CODEX_YAML: &str = include_str!("../../drivers/codex.yaml");
+
 pub const CLAUDE_EVENTS: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",
@@ -133,10 +136,19 @@ impl Env {
         std::fs::write(
             home.join("config.yml"),
             format!(
-                "tmux:\n  socket_name: {socket}\nsend:\n  settle_sec: 0.3\n  confirm_timeout: 3\nhold:\n  human_sec: 2\nkill:\n  timeout: 5\ndrivers:\n  claude:\n    submit_delay_ms: 100\n  codex:\n    submit_delay_ms: 100\n{extra}"
+                "tmux:\n  socket_name: {socket}\nsend:\n  settle_sec: 0.3\n  confirm_timeout: 3\nhold:\n  human_sec: 2\nkill:\n  timeout: 5\n{extra}"
             ),
         )
         .unwrap();
+        // The built-in drivers with a shorter paste delay, as the user's
+        // driver files (they replace the built-in ones as a whole).
+        let drivers = home.join("drivers");
+        std::fs::create_dir_all(&drivers).unwrap();
+        for (name, text, ms) in [("claude", CLAUDE_YAML, "200"), ("codex", CODEX_YAML, "500")] {
+            let fast = text.replace(&format!("submit_delay_ms: {ms}"), "submit_delay_ms: 100");
+            assert_ne!(fast, text);
+            std::fs::write(drivers.join(format!("{name}.yaml")), fast).unwrap();
+        }
         Env {
             tmp,
             home,

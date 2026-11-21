@@ -7,20 +7,17 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 
 use crate::config;
-use crate::driver::{self, Driver};
+use crate::driver::Driver;
 use crate::error::{Error, Result, warn};
 use crate::home::Home;
-use crate::hookconf::{self, Check, Dirs};
+use crate::hookconf::{self, Check, Lookup};
 use crate::util;
 
-fn drivers(names: &[String]) -> Result<Vec<Driver>> {
+fn drivers(home: &Home, names: &[String]) -> Result<Vec<Driver>> {
     if names.is_empty() {
-        return Ok(driver::ALL.to_vec());
+        return Driver::all(home);
     }
-    names
-        .iter()
-        .map(|n| Driver::from_name(n).ok_or_else(|| Error::usage(format!("unknown driver {n:?}"))))
-        .collect()
+    names.iter().map(|n| Driver::load(home, n)).collect()
 }
 
 /// Check the hooks for each driver without starting an agent. Exit code 0
@@ -37,15 +34,20 @@ pub fn doctor(names: &[String], cwd: Option<&Path>) -> Result<bool> {
         .ok_or_else(|| Error::usage(format!("not a directory: {}", cwd.display())))?;
     let home = Home::resolve()?;
     let cfg = config::load(&home)?;
-    let dirs = Dirs::from_env();
+    let lookup = Lookup::from_env();
     let mut ok = true;
     // What to suggest: installing tmac's hooks, or dealing with others.
     let mut need_install = false;
     let mut need_relay = false;
     let mut on_path = None;
-    for d in drivers(names)? {
+    for d in drivers(&home, names)? {
         let name = d.name();
-        let c = Check::run(d, &dirs, &cwd, &[name.to_string()])?;
+        let program = d
+            .commands()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| name.to_string());
+        let c = Check::run(&d, &lookup, &cwd, &[program])?;
         on_path = c.tmac_on_path.clone();
         let missing = c.missing();
         let dup = c.duplicated();
@@ -209,7 +211,11 @@ fn object<'a>(
 
 /// The rulesync sources for tmac's hooks: `hooks.jsonc` (merged into
 /// `base`, the user's own hooks) and `rulesync.jsonc`.
-pub fn rulesync_sources(base: Option<Value>, extra_targets: &[String]) -> Result<(Value, Value)> {
+pub fn rulesync_sources(
+    drivers: &[Driver],
+    base: Option<Value>,
+    extra_targets: &[String],
+) -> Result<(Value, Value)> {
     let mut root = match base.unwrap_or_else(|| json!({})) {
         Value::Object(m) => m,
         _ => return Err(Error::usage("the --merge file must be a JSON object")),
@@ -217,12 +223,17 @@ pub fn rulesync_sources(base: Option<Value>, extra_targets: &[String]) -> Result
     root.entry("version").or_insert(json!(1));
     object(&mut root, "hooks", "hooks")?;
     let mut targets: Vec<String> = Vec::new();
-    for d in driver::ALL {
-        let target = d.rulesync_target();
-        targets.push(target.to_string());
+    for d in drivers {
+        // A driver without rulesync.target is installed by hand.
+        let Some(target) = d.rulesync_target() else {
+            continue;
+        };
+        if !targets.iter().any(|t| t == target) {
+            targets.push(target.to_string());
+        }
         let section = object(&mut root, target, target)?;
         let hooks = object(section, "hooks", &format!("{target}.hooks"))?;
-        for &event in d.events() {
+        for event in d.events() {
             let list = hooks
                 .entry(event.to_string())
                 .or_insert_with(|| Value::Array(Vec::new()));
@@ -243,7 +254,7 @@ pub fn rulesync_sources(base: Option<Value>, extra_targets: &[String]) -> Result
                 continue;
             }
             list.push(json!({
-                "command": hookconf::hook_command(d, event),
+                "command": hookconf::hook_command(d.name(), event),
                 "timeout": d.hook_timeout(event),
             }));
         }
@@ -275,7 +286,8 @@ pub fn rulesync(dir: &Path, merge: Option<&Path>, extra_targets: &[String]) -> R
             )
         }
     };
-    let (hooks, config) = rulesync_sources(base, extra_targets)?;
+    let home = Home::resolve()?;
+    let (hooks, config) = rulesync_sources(&Driver::all(&home)?, base, extra_targets)?;
     std::fs::create_dir_all(dir)?;
     let header = format!(
         "// Written by `tmac hooks rulesync` (tmac {}). Do not edit: write your own hooks in\n\
@@ -307,6 +319,24 @@ fn pretty(v: &Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::Source;
+
+    fn builtins() -> Vec<Driver> {
+        vec![
+            Driver::parse(
+                "claude",
+                Source::Builtin,
+                include_str!("../../drivers/claude.yaml"),
+            )
+            .unwrap(),
+            Driver::parse(
+                "codex",
+                Source::Builtin,
+                include_str!("../../drivers/codex.yaml"),
+            )
+            .unwrap(),
+        ]
+    }
 
     #[test]
     fn jsonc() {
@@ -317,7 +347,7 @@ mod tests {
 
     #[test]
     fn sources_have_every_event() {
-        let (h, c) = rulesync_sources(None, &[]).unwrap();
+        let (h, c) = rulesync_sources(&builtins(), None, &[]).unwrap();
         assert_eq!(h["hooks"], json!({}));
         let stop = &h["claudecode"]["hooks"]["Stop"][0];
         assert_eq!(
@@ -328,7 +358,7 @@ mod tests {
         assert_eq!(h["codexcli"]["hooks"]["Interrupt"][0]["timeout"], 3);
         assert_eq!(
             h["claudecode"]["hooks"].as_object().unwrap().len(),
-            Driver::Claude.events().len()
+            builtins()[0].events().len()
         );
         assert_eq!(c["targets"], json!(["claudecode", "codexcli"]));
         assert_eq!(c["preserveUnownedHooks"], true);
@@ -341,14 +371,14 @@ mod tests {
             "hooks": {"sessionStart": [{"command": "echo mine"}]},
             "claudecode": {"hooks": {"Stop": [{"command": "echo stop"}]}},
         });
-        let (h, c) = rulesync_sources(Some(base), &["cursor".into()]).unwrap();
+        let (h, c) = rulesync_sources(&builtins(), Some(base), &["cursor".into()]).unwrap();
         assert_eq!(h["hooks"]["sessionStart"][0]["command"], "echo mine");
         let stop = h["claudecode"]["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 2);
         assert_eq!(stop[0]["command"], "echo stop");
         assert_eq!(c["targets"], json!(["claudecode", "codexcli", "cursor"]));
         // Merging the output again does not add tmac's hooks twice.
-        let (again, _) = rulesync_sources(Some(h.clone()), &[]).unwrap();
+        let (again, _) = rulesync_sources(&builtins(), Some(h.clone()), &[]).unwrap();
         assert_eq!(again, h);
     }
 }

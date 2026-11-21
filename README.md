@@ -139,6 +139,17 @@ tmac spawn impl-001 --relay 'Stop=lmm hook' --env LMM_NAME=impl-001 --pass-env P
 
 ドライバは、起動コマンドのファイル名（`claude`・`codex`）から決めます。`env` などのラッパーを通す場合は `--driver` を指定します。
 
+ドライバは YAML のファイルで、CLI ごとの違い（イベントの意味、入力と終了の作法、フックを調べる場所など）を、対応表と値として持ちます。手順はコードに入っています。
+
+```bash
+tmac driver list            # ドライバと、組み込みか利用者のファイルか
+tmac driver show claude     # 組み込みのファイルを書き出す
+tmac driver check           # すべてのドライバのファイルを確かめる
+```
+
+- `~/.tmac/drivers/<名前>.yaml` を置くと、同じ名前の組み込みのドライバを、ファイルごと置き換えます。CLI の動きが変わったときは、`tmac driver show` の出力を写して直してください。
+- 新しい名前のファイルを置くと、新しいドライバになります。未対応の CLI も、ファイルを書けば使えます。手順は仕様の §3.2「新しい CLI を足す」を参照してください。
+
 ## 設定
 
 `$TMAC_HOME/config.yml`（既定 `~/.tmac/config.yml`）。すべて省略できます。

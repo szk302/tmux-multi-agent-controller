@@ -46,6 +46,19 @@ pub enum Cmd {
     /// Install tmac's hooks for the user
     #[command(subcommand)]
     Hooks(HooksCmd),
+    /// Show and check the drivers (built-in and $TMAC_HOME/drivers/)
+    #[command(subcommand)]
+    Driver(DriverCmd),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DriverCmd {
+    /// List the drivers and where they come from
+    List,
+    /// Print the file of a driver (to copy to $TMAC_HOME/drivers/ and change)
+    Show { name: String },
+    /// Check a driver (by name or file), or every driver
+    Check { target: Option<String> },
 }
 
 #[derive(Args, Debug)]

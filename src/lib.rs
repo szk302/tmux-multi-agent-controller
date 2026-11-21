@@ -16,8 +16,8 @@ pub mod util;
 
 use clap::Parser;
 
-use crate::cli::{Cli, Cmd, HooksCmd};
-use crate::commands::{hook, hooks, input, manage, spawn};
+use crate::cli::{Cli, Cmd, DriverCmd, HooksCmd};
+use crate::commands::{drivers, hook, hooks, input, manage, spawn};
 
 /// Run the command line and return the exit code.
 pub fn run() -> i32 {
@@ -104,6 +104,9 @@ pub fn run() -> i32 {
             Err(e) => Err(e),
         },
         Cmd::Hooks(HooksCmd::Rulesync(r)) => hooks::rulesync(&r.dir, r.merge.as_deref(), &r.target),
+        Cmd::Driver(DriverCmd::List) => drivers::list(),
+        Cmd::Driver(DriverCmd::Show { name }) => drivers::show(&name),
+        Cmd::Driver(DriverCmd::Check { target }) => drivers::check(target.as_deref()),
     };
     match result {
         Ok(()) => 0,

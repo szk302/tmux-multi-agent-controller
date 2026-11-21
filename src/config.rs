@@ -26,8 +26,6 @@ pub struct Config {
     pub relay_timeout: f64,
     /// driver -> event -> command
     pub relay: BTreeMap<String, BTreeMap<String, String>>,
-    /// driver -> delay between paste and Enter, in milliseconds
-    pub submit_delay_ms: BTreeMap<String, u64>,
 }
 
 impl Default for Config {
@@ -44,7 +42,6 @@ impl Default for Config {
             hold_human_sec: 300.0,
             relay_timeout: 20.0,
             relay: BTreeMap::new(),
-            submit_delay_ms: BTreeMap::new(),
         }
     }
 }
@@ -66,16 +63,6 @@ impl ForeignHooks {
             ForeignHooks::All => true,
             ForeignHooks::Prefixes(p) => p.iter().any(|p| place.starts_with(p.as_str())),
         }
-    }
-}
-
-impl Config {
-    /// Delay between paste and Enter for a driver.
-    pub fn submit_delay(&self, driver: &str, default_ms: u64) -> u64 {
-        self.submit_delay_ms
-            .get(driver)
-            .copied()
-            .unwrap_or(default_ms)
     }
 }
 
@@ -215,7 +202,8 @@ pub fn parse(text: &str) -> std::result::Result<Config, String> {
                         cfg.relay_timeout = number(v2, "relay.timeout")?;
                         continue;
                     }
-                    if crate::driver::Driver::from_name(k2).is_none() {
+                    // Drivers can be the user's own (§3.2), so any valid name.
+                    if !crate::util::valid_name(k2) {
                         warn(format!("unknown config key: relay.{k2}"));
                         continue;
                     }
@@ -227,26 +215,10 @@ pub fn parse(text: &str) -> std::result::Result<Config, String> {
                     cfg.relay.insert(k2.to_string(), events);
                 }
             }
-            "drivers" => {
-                for (k2, v2) in mapping(v, "drivers")? {
-                    let d = k2.as_str().unwrap_or_default();
-                    if crate::driver::Driver::from_name(d).is_none() {
-                        warn(format!("unknown config key: drivers.{d}"));
-                        continue;
-                    }
-                    for (k3, v3) in mapping(v2, &format!("drivers.{d}"))? {
-                        match k3.as_str().unwrap_or_default() {
-                            "submit_delay_ms" => {
-                                let n = v3.as_u64().ok_or(format!(
-                                    "drivers.{d}.submit_delay_ms must be a non-negative integer"
-                                ))?;
-                                cfg.submit_delay_ms.insert(d.to_string(), n);
-                            }
-                            other => warn(format!("unknown config key: drivers.{d}.{other}")),
-                        }
-                    }
-                }
-            }
+            "drivers" => warn(
+                "drivers in the configuration is no longer used; the values are in the \
+                 driver files (tmac driver show)",
+            ),
             other => warn(format!("unknown config key: {other}")),
         }
     }
@@ -263,7 +235,7 @@ mod tests {
         assert_eq!(c.tmux_session, None);
         assert_eq!(c.send_settle_sec, 10.0);
         let c = parse(
-            "tmux:\n  session: agents\nrelay:\n  timeout: 5\n  claude:\n    Stop: lmm hook\nsend:\n  settle_sec: 30\nhold:\n  human_sec: 600\ndrivers:\n  codex:\n    submit_delay_ms: 700\n",
+            "tmux:\n  session: agents\nrelay:\n  timeout: 5\n  claude:\n    Stop: lmm hook\nsend:\n  settle_sec: 30\nhold:\n  human_sec: 600\n",
         )
         .unwrap();
         assert_eq!(c.tmux_session.as_deref(), Some("agents"));
@@ -271,8 +243,6 @@ mod tests {
         assert_eq!(c.relay["claude"]["Stop"], "lmm hook");
         assert_eq!(c.send_settle_sec, 30.0);
         assert_eq!(c.hold_human_sec, 600.0);
-        assert_eq!(c.submit_delay("codex", 1), 700);
-        assert_eq!(c.submit_delay("claude", 200), 200);
     }
 
     #[test]

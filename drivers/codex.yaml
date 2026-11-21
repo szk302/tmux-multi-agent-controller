@@ -1,0 +1,47 @@
+# codex driver (Codex CLI, checked with codex-cli 0.169.0). Built into tmac;
+# `tmac driver show codex` prints it. To change it, copy it to
+# $TMAC_HOME/drivers/codex.yaml and check it with `tmac driver check`.
+version: 1
+commands: [codex]
+
+events:
+  # Codex fires SessionStart with the first prompt of a session, not at
+  # start-up; /clear and resuming start another session without a SessionEnd.
+  SessionStart:      {after: idle, new_session: true, when: {source: [resume, clear]}}
+  UserPromptSubmit:  {role: prompt}
+  PreToolUse:        {before: busy}
+  PostToolUse:       {before: busy}
+  PermissionRequest: {before: waiting}
+  Stop:              {role: stop}
+  # Esc fires Interrupt instead of Stop.
+  Interrupt:         {after: idle}
+  SessionEnd:        {after: exited, unless: {reason: [clear, resume]}}
+
+payload:
+  session_id: session_id
+  prompt: prompt
+
+input:
+  submit_delay_ms: 500
+  exit_text: /quit
+
+relay:
+  blocked_json: {decision: block}
+
+hooks:
+  places:
+    - {file: /etc/codex/hooks.json, format: json, system: true}
+    - {file: /etc/codex/config.toml, format: toml, system: true}
+    - {file: "${CODEX_HOME:-~/.codex}/hooks.json", format: json}
+    - {file: "${CODEX_HOME:-~/.codex}/config.toml", format: toml}
+    # Each directory from the git root down to the working directory.
+    - {file: "{project_layers}/.codex/hooks.json", format: json}
+    - {file: "{project_layers}/.codex/config.toml", format: toml}
+    # -c hooks.EVENT=VALUE
+    - {arg: [-c, --config], format: toml-assign}
+
+rulesync:
+  target: codexcli
+  timeout: 30
+  # Codex cuts these hooks off after 3 seconds.
+  timeouts: {Interrupt: 3, SessionEnd: 3}
