@@ -1,0 +1,60 @@
+# claude driver (Claude Code). Built into tmac; `tmac driver show claude`
+# prints it. To change it, copy it to $TMAC_HOME/drivers/claude.yaml (the
+# whole file replaces the built-in one) and check it with `tmac driver check`.
+version: 1
+commands: [claude]
+
+# Hook events and what they mean (first matching rule wins). tmac's hook
+# must be installed for every event listed here.
+events:
+  SessionStart:
+    # /clear and resuming start another session (§6.2).
+    - {after: idle, new_session: true, when: {source: [resume, clear]}}
+    - {after: idle, when: {source: [startup]}}
+  UserPromptSubmit:   {role: prompt}
+  PreToolUse:         {before: busy}
+  PostToolUse:        {before: busy}
+  PostToolUseFailure: {before: busy}
+  Notification:
+    - {before: waiting, when: {notification_type: [permission_prompt, elicitation_dialog]}}
+    - {after: idle, when: {notification_type: [idle_prompt]}}
+  PermissionRequest:  {before: waiting}
+  Stop:               {role: stop}
+  SessionEnd:         {after: exited, unless: {reason: [clear, resume]}}
+
+# Keys in the hook input.
+payload:
+  session_id: session_id
+  prompt: prompt
+
+prompt:
+  # Prompts the CLI makes itself (notices of finished background tasks);
+  # they are not a person typing.
+  generated: ["<task-notification>"]
+
+input:
+  submit_delay_ms: 200
+  exit_text: /exit
+
+relay:
+  # Besides exit code 2, a relay stopped the stop or rejected the input when
+  # it exits 0 printing a JSON object with these values (lmm hook does).
+  blocked_json: {decision: block}
+
+hooks:
+  # Time limit Claude Code uses for a hook that sets none, in seconds.
+  default_timeout: 60
+  # Where tmac's hooks and other hooks are looked for (§5.6).
+  places:
+    - {file: "${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json", format: json}
+    - {file: "{project}/.claude/settings.json", format: json}
+    - {file: "{project}/.claude/settings.local.json", format: json}
+    - {file: /etc/claude-code/managed-settings.json, format: json, os: linux, system: true}
+    - {file: "/Library/Application Support/ClaudeCode/managed-settings.json", format: json, os: macos, system: true}
+    - {arg: --settings, format: json}
+    - {plugins: claude, dir: "${CLAUDE_CONFIG_DIR:-~/.claude}"}
+
+# How `tmac hooks rulesync` writes the hooks.
+rulesync:
+  target: claudecode
+  timeout: 30

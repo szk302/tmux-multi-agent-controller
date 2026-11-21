@@ -313,18 +313,25 @@ pub fn kill(agent_ref: &AgentRef, timeout: Option<f64>, force: bool) -> Result<(
             tracked = util::process_start_time(pid).map(|start| (pid, start));
         }
         if !force {
-            let driver = Driver::from_name(&agent.info.driver).unwrap_or(Driver::Claude);
-            if st.state == State::Idle {
+            // The driver's way to end the CLI; without one (or if the driver
+            // cannot be loaded any more), SIGTERM.
+            let exit = match Driver::load(&agent.home, &agent.info.driver) {
+                Ok(d) => d.exit_text().map(|t| (t.to_string(), d.submit_delay_ms())),
+                Err(e) => {
+                    warn(format!("{e}; ending {name} with SIGTERM"));
+                    None
+                }
+            };
+            if st.state == State::Idle
+                && let Some((exit_text, delay)) = &exit
+            {
                 let buffer = format!("tmac-{instance}-exit");
-                if tmux
-                    .load_buffer(&buffer, driver.exit_text().as_bytes())
-                    .is_ok()
+                if tmux.load_buffer(&buffer, exit_text.as_bytes()).is_ok()
                     && tmux
                         .paste_tagged(&p.id, &instance, &buffer)
                         .unwrap_or(false)
                 {
-                    let delay = cfg.submit_delay(driver.name(), driver.submit_delay_default_ms());
-                    std::thread::sleep(Duration::from_millis(delay));
+                    std::thread::sleep(Duration::from_millis(*delay));
                     let _ = tmux.send_key_tagged(&p.id, &instance, "Enter");
                 } else {
                     tmux.delete_buffer(&buffer);

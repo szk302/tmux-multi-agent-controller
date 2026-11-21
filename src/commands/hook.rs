@@ -44,10 +44,6 @@ pub fn run(args: HookArgs) -> i32 {
     let (Some(project), Some(name), Some(instance)) = (project, name, instance) else {
         return 0;
     };
-    let Some(driver) = Driver::from_name(&args.driver) else {
-        eprintln!("tmac: hook: unknown driver {:?}", args.driver);
-        return 1;
-    };
     if !util::valid_name(&name) || !util::valid_name(&project) {
         eprintln!("tmac: hook: invalid agent {project}/{name}");
         return 1;
@@ -76,15 +72,22 @@ pub fn run(args: HookArgs) -> i32 {
     };
     // Hooks are installed for the user, so a CLI started inside the agent
     // (another driver) runs them with the agent's environment (§6.2).
-    if agent.info.driver != driver.name() {
+    if agent.info.driver != args.driver {
         agent.log(
             agent.state().map(|s| s.seq).unwrap_or(0),
             "hook",
             &args.event,
-            &format!("ignored (a {} hook)", driver.name()),
+            &format!("ignored (a {} hook)", args.driver),
         );
         return 0;
     }
+    let driver = match Driver::load(&home, &args.driver) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("tmac: hook: {e}");
+            return 1;
+        }
+    };
     let cfg = config::load(&home).unwrap_or_else(|e| {
         warn(format!("{e}; using the default settings"));
         Config::default()
@@ -94,7 +97,7 @@ pub fn run(args: HookArgs) -> i32 {
 
     let mut failed = false;
     let before = driver.before(event, &json);
-    let logged = match apply_before(&agent, driver, before, event, &json) {
+    let logged = match apply_before(&agent, &driver, before, event, &json) {
         Ok(Outcome::Applied(logged)) => logged,
         Ok(Outcome::Replaced) => {
             warn(format!("ignoring {event} hook: {key} was replaced"));
@@ -115,7 +118,7 @@ pub fn run(args: HookArgs) -> i32 {
         .filter(|c| !c.trim().is_empty())
         .cloned();
     let (code, blocked) = match &relay {
-        Some(cmd) => run_relay(driver, cmd, &payload, event, cfg.relay_timeout),
+        Some(cmd) => run_relay(&driver, cmd, &payload, event, cfg.relay_timeout),
         None => (0, false),
     };
 
@@ -149,7 +152,7 @@ enum Outcome {
 /// while the agent is idle. Returns false for a hook of another session.
 fn same_session(
     agent: &Agent,
-    driver: Driver,
+    driver: &Driver,
     st: &mut StateFile,
     event: &str,
     payload: &Value,
@@ -180,7 +183,7 @@ fn same_session(
 /// Changes before the relay.
 fn apply_before(
     agent: &Agent,
-    driver: Driver,
+    driver: &Driver,
     before: Before,
     event: &str,
     payload: &Value,
@@ -221,8 +224,11 @@ fn apply_before(
 
 /// Match a submitted prompt against tmac's input; otherwise treat it as a
 /// person typing in the pane (§7.4, §9.3).
-fn match_prompt(agent: &Agent, driver: Driver, payload: &Value, state: State) -> Result<()> {
-    let prompt = payload.get("prompt").and_then(Value::as_str).unwrap_or("");
+fn match_prompt(agent: &Agent, driver: &Driver, payload: &Value, state: State) -> Result<()> {
+    let prompt = payload
+        .get(driver.prompt_key())
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let hash = util::text_hash(prompt);
     let mut ours = false;
     if let Some(hold) = agent.hold(UNCONFIRMED)? {
@@ -317,7 +323,7 @@ fn apply_after(
 
 /// Run the relay command with the hook input (§6.3). Returns its exit code
 /// and whether it blocked.
-fn run_relay(driver: Driver, cmd: &str, payload: &[u8], event: &str, timeout: f64) -> (i32, bool) {
+fn run_relay(driver: &Driver, cmd: &str, payload: &[u8], event: &str, timeout: f64) -> (i32, bool) {
     let mut child = match Command::new("/bin/sh")
         .arg("-c")
         .arg(cmd)

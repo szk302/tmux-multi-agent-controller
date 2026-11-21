@@ -1,5 +1,6 @@
 //! Subcommands.
 
+pub mod drivers;
 pub mod hook;
 pub mod hooks;
 pub mod input;
