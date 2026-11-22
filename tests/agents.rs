@@ -889,6 +889,28 @@ fn a_kill_during_spawn_leaves_no_pane() {
 }
 
 #[test]
+fn a_process_left_by_a_relay_does_not_hold_the_hook() {
+    // The relay ends at once, but leaves a process with its standard output.
+    let env = Env::new();
+    env.spawn(
+        "r9",
+        "claude",
+        &["--relay", "Stop=cat >/dev/null; echo '{}'; sleep 8 &"],
+        &[],
+    );
+    env.ok(&["send", "r9", "hello"]);
+    // Idle as soon as the relay's shell has ended, not 8 s later.
+    env.ok(&["wait", "r9", "--timeout", "3"]);
+    let stop = env
+        .events("r9")
+        .into_iter()
+        .rfind(|e| e["event"] == "Stop")
+        .unwrap();
+    assert_eq!(stop["out"], "{}", "{stop}");
+    env.ok(&["kill", "r9", "--force"]);
+}
+
+#[test]
 fn relays_get_the_working_directory_and_whether_the_stop_continues() {
     let env = Env::new();
     let seen = env.tmp.path().join("seen");

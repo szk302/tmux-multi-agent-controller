@@ -1,6 +1,7 @@
 //! `tmac hook` (§6): called by the CLI's hooks.
 
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -380,20 +381,20 @@ fn run_relay(
     };
     let stdin = child.stdin.take();
     let data = payload.to_vec();
-    let writer = thread::spawn(move || {
+    // Not joined: a relay that does not read its input must not hold the
+    // hook up (the thread ends with this process).
+    thread::spawn(move || {
         if let Some(mut s) = stdin {
             let _ = s.write_all(&data);
         }
     });
     let mut stdout = child.stdout.take().expect("piped stdout");
-    let reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
+    set_nonblocking(&stdout);
+    let mut out = Vec::new();
     let pgid = child.id() as i32;
     let deadline = Instant::now() + Duration::from_secs_f64(timeout);
     let status = loop {
+        read_available(&mut stdout, &mut out);
         match child.try_wait() {
             Ok(Some(s)) => break Some(s),
             Ok(None) => {}
@@ -415,8 +416,6 @@ fn run_relay(
                 }
                 thread::sleep(Duration::from_millis(50));
             }
-            let _ = writer.join();
-            let _ = reader.join();
             eprintln!(
                 "tmac: hook: the relay for {event} did not finish within {timeout}s and was stopped"
             );
@@ -424,11 +423,37 @@ fn run_relay(
         }
         thread::sleep(Duration::from_millis(20));
     };
-    let _ = writer.join();
-    let out = reader.join().unwrap_or_default();
+    // What the relay wrote before it ended is in the pipe now. A process it
+    // left running may keep the pipe open: do not wait for the end (§6.3).
+    read_available(&mut stdout, &mut out);
     let mut so = io::stdout();
     let _ = so.write_all(&out);
     let _ = so.flush();
     let code = status.and_then(|s| s.code()).unwrap_or(1);
     (code, driver.relay_blocked(code, &out))
+}
+
+/// Make reads from the pipe return at once when it has nothing.
+fn set_nonblocking(pipe: &impl AsRawFd) {
+    let fd = pipe.as_raw_fd();
+    // SAFETY: fcntl on a descriptor this process owns.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+/// Append what the pipe has now, without waiting for more.
+fn read_available(pipe: &mut impl Read, out: &mut Vec<u8>) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
 }
