@@ -15,13 +15,18 @@ use serde_json::Value;
 use crate::driver::{ArgFormat, BLOCKING_EVENTS, Driver, FileFormat, Place};
 use crate::error::{Error, Result};
 
-/// One hook command found in a place.
+/// One hook found in a place.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Found {
     /// Where it is, as reported to the user (a file path, `--settings`,
     /// `plugin NAME (PATH)`, `command line`).
     pub place: String,
     pub event: String,
+    /// The hook's `type`: `command` (also when not given), or another kind
+    /// the CLI runs itself, such as Claude Code's `prompt`, `agent`,
+    /// `http` and `mcp_tool` (§5.6).
+    pub kind: String,
+    /// The command; empty for the other kinds.
     pub command: String,
     /// Seconds, if the hook sets a time limit.
     pub timeout: Option<f64>,
@@ -136,7 +141,10 @@ fn read_toml(path: &Path) -> Option<Value> {
     serde_json::to_value(table).ok()
 }
 
-/// Hook commands in a hooks object (`{"Stop": [{"hooks": [{...}]}]}`).
+/// Hooks in a hooks object (`{"Stop": [{"hooks": [{...}]}]}`): every
+/// entry with a `command` or a `type`, so that hooks without a command
+/// (Claude Code's `prompt`, `agent`, `http`, `mcp_tool`), which can block
+/// `Stop` and `UserPromptSubmit` as well, are not missed.
 fn collect(place: &str, hooks: Option<&Value>, out: &mut Vec<Found>) {
     let Some(hooks) = hooks.and_then(Value::as_object) else {
         return;
@@ -152,13 +160,16 @@ fn collect(place: &str, hooks: Option<&Value>, out: &mut Vec<Found>) {
                 None => vec![g],
             };
             for h in list {
-                let Some(command) = h.get("command").and_then(Value::as_str) else {
+                let kind = h.get("type").and_then(Value::as_str);
+                let command = h.get("command").and_then(Value::as_str);
+                if kind.is_none() && command.is_none() {
                     continue;
-                };
+                }
                 out.push(Found {
                     place: place.to_string(),
                     event: event.clone(),
-                    command: command.to_string(),
+                    kind: kind.unwrap_or("command").to_string(),
+                    command: command.unwrap_or("").to_string(),
                     timeout: h.get("timeout").and_then(Value::as_f64),
                 });
             }
@@ -376,7 +387,8 @@ pub struct Check {
     /// tmac's hooks for each event of the driver.
     pub tmac: BTreeMap<String, Vec<Found>>,
     /// Places with other hooks on events that can block, as
-    /// `PLACE: hooks.EVENT`.
+    /// `PLACE: hooks.EVENT`, followed by ` (KIND)` for a hook that is not a
+    /// command.
     pub foreign: Vec<String>,
     /// `tmac` in the PATH the agent gets.
     pub tmac_on_path: Option<PathBuf>,
@@ -392,7 +404,12 @@ impl Check {
             .collect();
         let mut foreign = Vec::new();
         for f in found {
-            match tmac_hook_target(&f.command) {
+            let target = if f.kind == "command" {
+                tmac_hook_target(&f.command)
+            } else {
+                None
+            };
+            match target {
                 // tmac's hook for this driver, or for another one (it does
                 // nothing in this CLI, §6.2).
                 Some((d, e)) => {
@@ -405,7 +422,10 @@ impl Check {
                 }
                 None => {
                     if BLOCKING_EVENTS.contains(&f.event.as_str()) {
-                        let line = format!("{}: hooks.{}", f.place, f.event);
+                        let mut line = format!("{}: hooks.{}", f.place, f.event);
+                        if f.kind != "command" {
+                            line.push_str(&format!(" ({})", f.kind));
+                        }
                         if !foreign.contains(&line) {
                             foreign.push(line);
                         }
@@ -624,6 +644,63 @@ mod tests {
             "30 s is enough for a 20 s relay"
         );
         assert_eq!(c.short_timeouts(["Stop"].into_iter(), 25.0).len(), 2);
+    }
+
+    #[test]
+    fn hooks_without_a_command_count_as_others() {
+        let t = tempfile::tempdir().unwrap();
+        let cwd = t.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let claude = builtin("claude");
+        let mut m = serde_json::Map::new();
+        for e in claude.events() {
+            m.insert(
+                e.to_string(),
+                serde_json::json!([{"hooks": [{"type": "command",
+                    "command": hook_command("claude", e), "timeout": 30}]}]),
+            );
+        }
+        let mut v = serde_json::json!({ "hooks": m });
+        let mut add = |event: &str, hook: Value| {
+            v["hooks"][event]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({ "hooks": [hook] }));
+        };
+        add(
+            "Stop",
+            serde_json::json!({"type": "prompt", "prompt": "Done?"}),
+        );
+        add(
+            "UserPromptSubmit",
+            serde_json::json!({"type": "http", "url": "http://127.0.0.1:9/check"}),
+        );
+        // Not on an event that can block.
+        add(
+            "PreToolUse",
+            serde_json::json!({"type": "agent", "prompt": "Safe?"}),
+        );
+        // Neither a command nor a type: not a hook.
+        add("Stop", serde_json::json!({"timeout": 5}));
+        write(&cwd.join(".claude/settings.json"), &v.to_string());
+        let c = Check::run(&claude, &lookup(t.path()), &cwd, &["claude".into()]).unwrap();
+        assert!(c.missing().is_empty());
+        assert!(c.duplicated().is_empty());
+        assert_eq!(c.foreign.len(), 2, "{:?}", c.foreign);
+        assert!(
+            c.foreign
+                .iter()
+                .any(|f| f.ends_with(".claude/settings.json: hooks.Stop (prompt)")),
+            "{:?}",
+            c.foreign
+        );
+        assert!(
+            c.foreign
+                .iter()
+                .any(|f| f.ends_with(".claude/settings.json: hooks.UserPromptSubmit (http)")),
+            "{:?}",
+            c.foreign
+        );
     }
 
     #[test]

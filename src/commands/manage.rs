@@ -284,14 +284,19 @@ pub fn kill(agent_ref: &AgentRef, timeout: Option<f64>, force: bool) -> Result<(
     let name = &agent_ref.to_string();
     let home = Home::resolve()?;
     let cfg = config::load(&home)?;
-    let agent = Agent::require(&home, agent_ref)?;
+    let loaded = Agent::require(&home, agent_ref)?;
     let sig = util::signal_flag();
     let _input = home.lock(agent_ref, LockKind::Input, None, Some(&sig))?;
-    if !agent.still_current()? {
-        return Err(Error::NoAgent(format!(
-            "agent {name} is gone or was replaced"
-        )));
-    }
+    // Read the record again: a spawn that held the lock has put its pane
+    // in it meanwhile (§5.3).
+    let agent = match Agent::load(&home, agent_ref)? {
+        Some(a) if a.instance() == loaded.instance() => a,
+        _ => {
+            return Err(Error::NoAgent(format!(
+                "agent {name} is gone or was replaced"
+            )));
+        }
+    };
     {
         let _g = home.state_lock(agent_ref)?;
         let st = agent.state()?;

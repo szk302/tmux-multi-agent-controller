@@ -4,7 +4,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::Env;
+use common::{Env, PROJECT};
 
 fn state(env: &Env, name: &str) -> String {
     env.field(name, "state")
@@ -236,6 +236,36 @@ fn unconfirmed_input_is_held() {
 }
 
 #[test]
+fn a_slow_relay_does_not_leave_the_input_unconfirmed() {
+    // The UserPromptSubmit relay takes longer than send.confirm_timeout
+    // (3 s here) for the first prompt only.
+    let env = Env::new();
+    env.spawn(
+        "u2",
+        "claude",
+        &[
+            "--relay",
+            "UserPromptSubmit=if grep -q slow; then sleep 5; fi",
+        ],
+        &[],
+    );
+    // send gives up waiting and holds further input as unconfirmed ...
+    env.expect(&["send", "u2", "slow one"], 6);
+    assert_eq!(env.status("u2")["holds"][0], "unconfirmed");
+    // ... until the relay ends: the CLI took the input.
+    env.until("the unconfirmed hold to go", || {
+        env.status("u2")["holds"]
+            .as_sequence()
+            .is_some_and(|h| h.is_empty())
+    });
+    env.ok(&["wait", "u2", "--timeout", "20"]);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    env.ok(&["send", "u2", "--no-wait", "again"]);
+    assert_eq!(env.prompts("u2"), ["slow one", "again"]);
+    env.ok(&["kill", "u2", "--force"]);
+}
+
+#[test]
 fn exited_agents_and_stale_hooks() {
     let env = Env::new();
     env.spawn("e1", "claude", &[], &[]);
@@ -372,6 +402,35 @@ fn foreign_hooks_are_refused() {
 }
 
 #[test]
+fn hooks_without_a_command_are_refused_too() {
+    // Claude Code runs prompt, agent, http and mcp_tool hooks on Stop and
+    // UserPromptSubmit as well, and they can block.
+    let env = Env::new();
+    std::fs::create_dir_all(env.work.join(".claude")).unwrap();
+    std::fs::write(
+        env.work.join(".claude/settings.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"prompt","prompt":"Do the tests pass?"}]}]}}"#,
+    )
+    .unwrap();
+    let fake = common::fake_as(&env, "claude");
+    let out = env.tmac(&["spawn", "p1", "--", fake.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(".claude/settings.json: hooks.Stop (prompt)"),
+        "{out:?}"
+    );
+    assert!(!env.agent_dir("p1").exists());
+    let out = env.tmac(&["doctor", "claude"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("hooks.Stop (prompt)"),
+        "{out:?}"
+    );
+    env.spawn("p1", "claude", &["--allow-foreign-hooks"], &[]);
+    env.ok(&["kill", "p1"]);
+}
+
+#[test]
 fn usage_errors() {
     let env = Env::new();
     env.expect(&["spawn", "Bad", "--", "claude"], 2);
@@ -394,6 +453,21 @@ fn usage_errors() {
     env.expect(&["send", "nobody", "a\x1bb"], 2);
     env.expect(&["status", "nobody"], 4);
     env.expect(&["wait", "nobody", "--state", "sleepy"], 2);
+    // Seconds must be numbers from 0 to 1e9 (a bad one used to panic).
+    for bad in ["-1", "NaN", "inf", "1e10", "soon"] {
+        let t = format!("--timeout={bad}");
+        env.expect(&["wait", "nobody", &t], 2);
+        env.expect(&["send", "nobody", "x", &t], 2);
+        env.expect(&["wake", "nobody", "x", &t], 2);
+        env.expect(&["hold", "nobody", &t], 2);
+        env.expect(&["kill", "nobody", &t], 2);
+        env.expect(&["spawn", "x", &t, "--", "claude"], 2);
+        env.expect(
+            &["spawn", "x", &format!("--human-hold={bad}"), "--", "claude"],
+            2,
+        );
+    }
+    assert!(!env.agent_dir("x").exists());
     // A hook never fails with 2, even on bad arguments.
     env.expect(&["hook"], 1);
     // Without an agent in the environment, a hook does nothing.
@@ -725,6 +799,115 @@ fn session_variables_of_a_parent_cli_are_removed() {
     let agent = std::fs::read_to_string(env.agent_dir("v1").join("agent.yml")).unwrap();
     assert!(!agent.contains("exec-clean"), "{agent}");
     env.ok(&["kill", "v1"]);
+}
+
+#[test]
+fn the_variables_of_the_agent_that_made_the_session_stay_its_own() {
+    // The first spawn makes the session (new-session -e): its variables
+    // must not reach the next agents.
+    let env = Env::new();
+    env.spawn("s1", "claude", &["-e", "CLAUDE_TEST_MAILBOX=first"], &[]);
+    env.spawn("s2", "claude", &[], &[]);
+    let start = |name: &str| {
+        env.events(name)
+            .into_iter()
+            .find(|e| e["event"] == "start")
+            .unwrap()
+    };
+    assert_eq!(start("s1")["env"]["CLAUDE_TEST_MAILBOX"], "first");
+    let second = start("s2");
+    assert!(
+        second["env"].get("CLAUDE_TEST_MAILBOX").is_none(),
+        "{second}"
+    );
+    assert_eq!(second["env"]["TMAC_AGENT"], "s2");
+    let shown = env.tmux(&["show-environment", "-t", &format!("={PROJECT}")]);
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    for k in [
+        "CLAUDE_TEST_MAILBOX",
+        "TMAC_AGENT",
+        "TMAC_INSTANCE",
+        "FAKE_LOG",
+    ] {
+        assert!(!shown.contains(&format!("{k}=")), "{k} in {shown}");
+    }
+    env.ok(&["kill", "s1"]);
+    env.ok(&["kill", "s2"]);
+}
+
+#[test]
+fn a_kill_during_spawn_leaves_no_pane() {
+    let env = Env::new();
+    // A tmux that is slow to make windows, so that the kill comes after
+    // spawn made the record and before it made the pane.
+    let real = std::process::Command::new("sh")
+        .args(["-c", "command -v tmux"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    let slow = env.tmp.path().join("slow-bin");
+    std::fs::create_dir_all(&slow).unwrap();
+    let wrapper = slow.join("tmux");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in new-window|new-session) sleep 2; break;; esac; done\nexec '{real}' \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &wrapper,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    // The session (and the server) stays after the agent's pane goes.
+    env.ok(&["session", "--create"]);
+    let fake = common::fake_as(&env, "claude");
+    let path = format!(
+        "{}:{}:{}",
+        slow.display(),
+        common::tmac_dir().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let spawn = env
+        .cmd(&["spawn", "k1", "--", fake.to_str().unwrap()])
+        .env("PATH", path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    env.until("the record of k1", || env.agent_dir("k1").exists());
+    // kill waits for spawn to put the pane in the record, then ends it.
+    env.ok(&["kill", "k1", "--force"]);
+    let out = spawn.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(4), "{out:?}");
+    env.expect(&["status", "k1"], 4);
+    let panes = env.tmux(&["list-panes", "-a", "-F", "#{window_name} #{@tmac_agent}"]);
+    assert!(panes.status.success(), "{panes:?}");
+    let panes = String::from_utf8_lossy(&panes.stdout);
+    assert!(!panes.contains("k1"), "{panes}");
+}
+
+#[test]
+fn a_process_left_by_a_relay_does_not_hold_the_hook() {
+    // The relay ends at once, but leaves a process with its standard output.
+    let env = Env::new();
+    env.spawn(
+        "r9",
+        "claude",
+        &["--relay", "Stop=cat >/dev/null; echo '{}'; sleep 8 &"],
+        &[],
+    );
+    env.ok(&["send", "r9", "hello"]);
+    // Idle as soon as the relay's shell has ended, not 8 s later.
+    env.ok(&["wait", "r9", "--timeout", "3"]);
+    let stop = env
+        .events("r9")
+        .into_iter()
+        .rfind(|e| e["event"] == "Stop")
+        .unwrap();
+    assert_eq!(stop["out"], "{}", "{stop}");
+    env.ok(&["kill", "r9", "--force"]);
 }
 
 #[test]

@@ -137,7 +137,7 @@ tmac spawn impl-001 --relay 'Stop=lmm hook' --env LMM_NAME=impl-001 --pass-env P
 
 | ドライバ | CLI | 注意 |
 | :--- | :--- | :--- |
-| `claude` | Claude Code | `Stop`・`UserPromptSubmit` に tmac 以外のフック（プラグインを含む）があると、起動を断ります。停止を止めないフックなら `--allow-foreign-hooks` で起動できます。 |
+| `claude` | Claude Code | `Stop`・`UserPromptSubmit` に tmac 以外のフック（プラグインのもの、`prompt`・`agent`・`http`・`mcp_tool` の型のものを含む）があると、起動を断ります。停止を止めないフックなら `--allow-foreign-hooks` で起動できます。 |
 | `codex` | Codex CLI | Codex は起動しただけではフックを呼ばないため、tmac がドライバの既定の指示を、起動コマンドの最後に加えます。`--first-prompt <TEXT>` で変え、`--no-first-prompt` で加えないようにできます（起動コマンドに自分で指示を書く場合）。 |
 
 AI CLI の中から tmac を実行しても、親の CLI がセッションに設定した変数（`CLAUDECODE` など）は外して起動します。

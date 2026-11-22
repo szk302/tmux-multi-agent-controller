@@ -131,6 +131,73 @@ fn sessions_are_made_from_the_terminal() {
 }
 
 #[test]
+fn sessions_get_the_terminals_environment_on_a_running_server() {
+    // The server already runs, started with other values (another
+    // terminal, or a process with few variables).
+    let env = Env::new();
+    let stale = env.tmp.path().join("claude-stale");
+    std::fs::create_dir_all(&stale).unwrap();
+    let started = Command::new("tmux")
+        .args([
+            "-L",
+            &env.socket,
+            "new-session",
+            "-d",
+            "-s",
+            "other",
+            "sleep 600",
+        ])
+        .env("CLAUDE_CONFIG_DIR", &stale)
+        .env("CLAUDE_TEST_GONE", "1")
+        .env_remove("TMUX")
+        .status()
+        .unwrap();
+    assert!(started.success());
+    // The terminal: tmac's hooks in its CLAUDE_CONFIG_DIR, no
+    // CLAUDE_TEST_GONE, inside an agent's pane (TMAC_AGENT), and variables
+    // too long for one tmux call together or at all.
+    let big = "x".repeat(9000);
+    let out = env
+        .cmd(&["session", "--create"])
+        .env("TMAC_AGENT", "outer")
+        .env("CLAUDE_TEST_BIG1", &big)
+        .env("CLAUDE_TEST_BIG2", &big)
+        .env("CLAUDE_TEST_HUGE", "y".repeat(20000))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("CLAUDE_TEST_HUGE is too long"),
+        "{out:?}"
+    );
+    let shown = env.tmux(&[
+        "show-environment",
+        "-t",
+        &format!("={PROJECT}"),
+        "TMAC_AGENT",
+    ]);
+    assert!(!shown.status.success(), "{shown:?}");
+    env.spawn("e1", "claude", &["--no-create-session"], &[]);
+    let start = env
+        .events("e1")
+        .into_iter()
+        .find(|e| e["event"] == "start")
+        .unwrap();
+    assert_eq!(
+        start["env"]["CLAUDE_CONFIG_DIR"].as_str(),
+        env.claude_dir().to_str(),
+        "{start}"
+    );
+    assert!(start["env"].get("CLAUDE_TEST_GONE").is_none(), "{start}");
+    assert!(start["env"].get("CLAUDE_TEST_HUGE").is_none());
+    for k in ["CLAUDE_TEST_BIG1", "CLAUDE_TEST_BIG2"] {
+        assert_eq!(start["env"][k].as_str(), Some(big.as_str()), "{k}");
+    }
+    assert_eq!(start["env"]["TMAC_AGENT"], "e1");
+    env.ok(&["kill", "e1"]);
+}
+
+#[test]
 fn attach_shows_the_agents_window() {
     let env = Env::new();
     env.spawn("a1", "claude", &[], &[]);
@@ -145,7 +212,23 @@ fn attach_shows_the_agents_window() {
     let term = env.terminal(&[env!("CARGO_BIN_EXE_tmac"), "attach", "a1"]);
     env.until("the terminal on the agent", || env.clients() == ["a1"]);
     drop(term);
-    // Inside another tmux server, it refuses to nest.
+    // Inside another tmux server, it refuses to nest, and leaves the
+    // session's window as it was.
+    let current = || {
+        let out = env.tmux(&[
+            "list-windows",
+            "-t",
+            &format!("={PROJECT}"),
+            "-F",
+            "#{window_active} #{window_name}",
+        ]);
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("1 ").map(str::to_string))
+            .unwrap_or_default()
+    };
+    env.tmux(&["select-window", "-t", &format!("={PROJECT}:=shell")]);
+    assert_eq!(current(), "shell");
     let out = env
         .cmd(&["attach", "a1"])
         .env("TMUX", "/elsewhere/default,1,0")
@@ -153,6 +236,7 @@ fn attach_shows_the_agents_window() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     assert!(String::from_utf8_lossy(&out.stderr).contains("inside another tmux server"));
+    assert_eq!(current(), "shell");
     env.expect(&["attach", "nobody"], 4);
     env.ok(&["kill", "a1"]);
 }

@@ -1,6 +1,7 @@
 //! `tmac hook` (§6): called by the CLI's hooks.
 
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -97,8 +98,8 @@ pub fn run(args: HookArgs) -> i32 {
 
     let mut failed = false;
     let before = driver.before(event, &json);
-    let logged = match apply_before(&agent, &driver, before, event, &json) {
-        Ok(Outcome::Applied(logged)) => logged,
+    let (logged, submitted) = match apply_before(&agent, &driver, before, event, &json) {
+        Ok(Outcome::Applied { logged, submitted }) => (logged, submitted),
         Ok(Outcome::Replaced) => {
             warn(format!("ignoring {event} hook: {key} was replaced"));
             return 0;
@@ -107,7 +108,7 @@ pub fn run(args: HookArgs) -> i32 {
         Err(e) => {
             warn(format!("{event}: cannot update the state of {key}: {e}"));
             failed = true;
-            false
+            (false, None)
         }
     };
 
@@ -129,7 +130,7 @@ pub fn run(args: HookArgs) -> i32 {
     };
 
     let after = driver.after(event, &json);
-    if let Err(e) = apply_after(&agent, after, event, blocked, logged) {
+    if let Err(e) = apply_after(&agent, after, event, blocked, logged, submitted.as_deref()) {
         warn(format!("{event}: cannot update the state of {key}: {e}"));
         failed = true;
     }
@@ -149,8 +150,12 @@ enum Outcome {
     /// The hook came from another session of the CLI, such as a CLI the
     /// agent started (§6.2): ignored.
     OtherSession,
-    /// Applied; whether the event was logged.
-    Applied(bool),
+    /// Applied: whether the event was logged, and the ID of tmac's input
+    /// this prompt submitted (`UserPromptSubmit`, §7.4).
+    Applied {
+        logged: bool,
+        submitted: Option<String>,
+    },
 }
 
 /// Keep the session ID of the agent's CLI (§6.2): record the first one, and
@@ -205,6 +210,7 @@ fn apply_before(
     agent.expire_holds(&st)?;
     let holds_before = agent.active_holds(&st)?;
     let from = st.state;
+    let mut submitted = None;
     let logged = match before {
         Before::None => false,
         Before::To(s) => {
@@ -217,7 +223,7 @@ fn apply_before(
             true
         }
         Before::Prompt => {
-            match_prompt(agent, driver, payload, st.state)?;
+            submitted = match_prompt(agent, driver, payload, st.state)?;
             agent.transition(&mut st, State::Busy, "hook", event)?;
             true
         }
@@ -225,18 +231,25 @@ fn apply_before(
     if st.state != from || agent.active_holds(&st)? != holds_before {
         ops::refresh_display(agent, &st);
     }
-    Ok(Outcome::Applied(logged))
+    Ok(Outcome::Applied { logged, submitted })
 }
 
 /// Match a submitted prompt against tmac's input; otherwise treat it as a
-/// person typing in the pane (§7.4, §9.3).
-fn match_prompt(agent: &Agent, driver: &Driver, payload: &Value, state: State) -> Result<()> {
+/// person typing in the pane (§7.4, §9.3). Returns the ID of tmac's input
+/// it marked `submitted`.
+fn match_prompt(
+    agent: &Agent,
+    driver: &Driver,
+    payload: &Value,
+    state: State,
+) -> Result<Option<String>> {
     let prompt = payload
         .get(driver.prompt_key())
         .and_then(Value::as_str)
         .unwrap_or("");
     let hash = util::text_hash(prompt);
     let mut ours = false;
+    let mut submitted = None;
     if let Some(hold) = agent.hold(UNCONFIRMED)? {
         // Whatever was in the input box has now been submitted.
         agent.remove_hold(UNCONFIRMED)?;
@@ -248,6 +261,7 @@ fn match_prompt(agent: &Agent, driver: &Driver, payload: &Value, state: State) -
     {
         input.progress = Progress::Submitted;
         agent.write_input(&input)?;
+        submitted = Some(input.id.clone());
         ours = true;
     }
     // A prompt during start-up comes from the command line (a first
@@ -267,16 +281,18 @@ fn match_prompt(agent: &Agent, driver: &Driver, payload: &Value, state: State) -
             input_id: None,
         })?;
     }
-    Ok(())
+    Ok(submitted)
 }
 
-/// Changes after the relay.
+/// Changes after the relay. `submitted`: the ID of tmac's input this
+/// prompt submitted before the relay.
 fn apply_after(
     agent: &Agent,
     after: After,
     event: &str,
     blocked: bool,
     logged: bool,
+    submitted: Option<&str>,
 ) -> Result<()> {
     let _g = agent.home.state_lock(&agent.key())?;
     if !agent.still_current()? {
@@ -305,6 +321,15 @@ fn apply_after(
                     Progress::Confirmed
                 };
                 agent.write_input(&input)?;
+            } else if let Some(id) = submitted
+                && agent
+                    .hold(UNCONFIRMED)?
+                    .is_some_and(|h| h.input_id.as_deref() == Some(id))
+            {
+                // send stopped waiting while the relay ran and held further
+                // input as unconfirmed (§7.3). The CLI has taken this input
+                // (or dropped it, if rejected): the input box is empty.
+                agent.remove_hold(UNCONFIRMED)?;
             }
             if blocked {
                 // The CLI drops a rejected prompt and stays ready for input.
@@ -356,20 +381,20 @@ fn run_relay(
     };
     let stdin = child.stdin.take();
     let data = payload.to_vec();
-    let writer = thread::spawn(move || {
+    // Not joined: a relay that does not read its input must not hold the
+    // hook up (the thread ends with this process).
+    thread::spawn(move || {
         if let Some(mut s) = stdin {
             let _ = s.write_all(&data);
         }
     });
     let mut stdout = child.stdout.take().expect("piped stdout");
-    let reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
+    set_nonblocking(&stdout);
+    let mut out = Vec::new();
     let pgid = child.id() as i32;
     let deadline = Instant::now() + Duration::from_secs_f64(timeout);
     let status = loop {
+        read_available(&mut stdout, &mut out);
         match child.try_wait() {
             Ok(Some(s)) => break Some(s),
             Ok(None) => {}
@@ -391,8 +416,6 @@ fn run_relay(
                 }
                 thread::sleep(Duration::from_millis(50));
             }
-            let _ = writer.join();
-            let _ = reader.join();
             eprintln!(
                 "tmac: hook: the relay for {event} did not finish within {timeout}s and was stopped"
             );
@@ -400,11 +423,37 @@ fn run_relay(
         }
         thread::sleep(Duration::from_millis(20));
     };
-    let _ = writer.join();
-    let out = reader.join().unwrap_or_default();
+    // What the relay wrote before it ended is in the pipe now. A process it
+    // left running may keep the pipe open: do not wait for the end (§6.3).
+    read_available(&mut stdout, &mut out);
     let mut so = io::stdout();
     let _ = so.write_all(&out);
     let _ = so.flush();
     let code = status.and_then(|s| s.code()).unwrap_or(1);
     (code, driver.relay_blocked(code, &out))
+}
+
+/// Make reads from the pipe return at once when it has nothing.
+fn set_nonblocking(pipe: &impl AsRawFd) {
+    let fd = pipe.as_raw_fd();
+    // SAFETY: fcntl on a descriptor this process owns.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+/// Append what the pipe has now, without waiting for more.
+fn read_available(pipe: &mut impl Read, out: &mut Vec<u8>) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
 }
