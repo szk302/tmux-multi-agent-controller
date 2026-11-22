@@ -212,7 +212,23 @@ fn attach_shows_the_agents_window() {
     let term = env.terminal(&[env!("CARGO_BIN_EXE_tmac"), "attach", "a1"]);
     env.until("the terminal on the agent", || env.clients() == ["a1"]);
     drop(term);
-    // Inside another tmux server, it refuses to nest.
+    // Inside another tmux server, it refuses to nest, and leaves the
+    // session's window as it was.
+    let current = || {
+        let out = env.tmux(&[
+            "list-windows",
+            "-t",
+            &format!("={PROJECT}"),
+            "-F",
+            "#{window_active} #{window_name}",
+        ]);
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("1 ").map(str::to_string))
+            .unwrap_or_default()
+    };
+    env.tmux(&["select-window", "-t", &format!("={PROJECT}:=shell")]);
+    assert_eq!(current(), "shell");
     let out = env
         .cmd(&["attach", "a1"])
         .env("TMUX", "/elsewhere/default,1,0")
@@ -220,6 +236,7 @@ fn attach_shows_the_agents_window() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     assert!(String::from_utf8_lossy(&out.stderr).contains("inside another tmux server"));
+    assert_eq!(current(), "shell");
     env.expect(&["attach", "nobody"], 4);
     env.ok(&["kill", "a1"]);
 }

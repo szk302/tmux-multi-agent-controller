@@ -162,9 +162,13 @@ pub fn attach(agent_ref: &AgentRef) -> Result<()> {
         .find_pane(agent.instance())?
         .ok_or_else(|| Error::NoAgent(format!("the pane of {name} is gone")))?;
     let (session, socket) = tmux.pane_session(&pane.id)?;
-    tmux.select(&pane.id)?;
+    // Decide whether this terminal can show it before selecting the window,
+    // so that a refused attach changes nothing.
     match std::env::var("TMUX").ok().filter(|v| !v.is_empty()) {
-        None => Err(tmux.exec_attach(&session)),
+        None => {
+            tmux.select(&pane.id)?;
+            Err(tmux.exec_attach(&session))
+        }
         Some(v) => {
             let inside = v.split(',').next().unwrap_or("");
             if inside != socket {
@@ -173,6 +177,7 @@ pub fn attach(agent_ref: &AgentRef) -> Result<()> {
                      {socket}. Detach first, or run `tmux -S {socket} attach -t ={session}`"
                 )));
             }
+            tmux.select(&pane.id)?;
             tmux.run(&["switch-client".into(), "-t".into(), format!("={session}")])
                 .map(|_| ())
         }
