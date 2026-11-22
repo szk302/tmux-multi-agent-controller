@@ -1,14 +1,29 @@
 //! `tmac project`, `tmac session` and `tmac attach` (§3.1, §5.8, §10.1):
 //! names and the terminal side of the tmux sessions agents run in.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::config;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, warn};
 use crate::home::Home;
 use crate::project::{self, AgentRef};
 use crate::record::Agent;
-use crate::tmux::Tmux;
+use crate::tmux::{Tmux, escape_arg};
+
+/// Variables `session --create` does not give the session: tmux's own, and
+/// the ones that name an agent (set when it runs in an agent's pane).
+const NOT_COPIED: &[&str] = &[
+    "TMUX",
+    "TMUX_PANE",
+    "TMAC_PROJECT",
+    "TMAC_AGENT",
+    "TMAC_INSTANCE",
+];
+
+/// Bytes of arguments in one tmux call: tmux refuses a command of about
+/// 16 KB ("command too long", tmux 3.7c).
+const CALL_BYTES: usize = 12 * 1024;
 
 /// Print the project of a directory (§3.1). With `dir`, the project comes
 /// from that directory only (rule 3), not from -p or TMAC_PROJECT.
@@ -40,23 +55,99 @@ pub fn session(explicit: Option<&str>, create: bool) -> Result<()> {
     if create {
         let tmux = Tmux::with_socket_name(cfg.tmux_socket_name.as_deref());
         if !tmux.has_session(&name)? {
-            let made = tmux.run(&[
-                "new-session".into(),
-                "-d".into(),
-                "-s".into(),
-                name.clone(),
-                "-c".into(),
-                cwd.to_string_lossy().into_owned(),
-            ]);
-            match made {
-                Ok(_) => {}
-                // Made by someone else in between.
-                Err(e) if e.to_string().contains("duplicate session") => {}
-                Err(e) => return Err(e),
-            }
+            create_session(&tmux, &name, &cwd)?;
         }
     }
     println!("{name}");
+    Ok(())
+}
+
+/// Create the session with this process's environment (§5.8). A server
+/// that already runs gives a new session its own environment (only the
+/// variables of `update-environment` come from the client), so the
+/// differences are set on the session: with `-e` (the first window gets
+/// them, too) as far as one tmux call takes them, then with
+/// `set-environment`, and `set-environment -r` for the variables this
+/// process does not have.
+fn create_session(tmux: &Tmux, name: &str, cwd: &Path) -> Result<()> {
+    let target = format!("={name}");
+    let mut first: Vec<String> = vec![
+        "new-session".into(),
+        "-d".into(),
+        "-s".into(),
+        name.to_string(),
+        "-c".into(),
+        escape_arg(&cwd.to_string_lossy()),
+    ];
+    let mut size: usize = first.iter().map(|a| a.len() + 1).sum();
+    let mut later: Vec<Vec<String>> = Vec::new();
+    // No server: the new one starts with this process's environment.
+    if let Some(server) = tmux.environment(None)? {
+        let own: BTreeMap<String, String> = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .filter(|(k, _)| !NOT_COPIED.contains(&k.as_str()))
+            .collect();
+        for (k, v) in &own {
+            if server.get(k) == Some(v) {
+                continue;
+            }
+            let pair = escape_arg(&format!("{k}={v}"));
+            if pair.len() + 64 > CALL_BYTES {
+                warn(format!(
+                    "{k} is too long for tmux ({} bytes); the session does not get it",
+                    pair.len()
+                ));
+                continue;
+            }
+            if later.is_empty() && size + pair.len() + 4 <= CALL_BYTES {
+                size += pair.len() + 4;
+                first.extend(["-e".into(), pair]);
+            } else {
+                later.push(vec![
+                    "set-environment".into(),
+                    "-t".into(),
+                    target.clone(),
+                    k.clone(),
+                    escape_arg(v),
+                ]);
+            }
+        }
+        for k in server.keys() {
+            if !own.contains_key(k) && !NOT_COPIED.contains(&k.as_str()) {
+                later.push(vec![
+                    "set-environment".into(),
+                    "-t".into(),
+                    target.clone(),
+                    "-r".into(),
+                    k.clone(),
+                ]);
+            }
+        }
+    }
+    match tmux.run(&first) {
+        Ok(_) => {}
+        // Made by someone else in between: leave its environment alone.
+        Err(e) if e.to_string().contains("duplicate session") => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    let mut call: Vec<String> = Vec::new();
+    let mut size = 0;
+    for cmd in later {
+        let n: usize = cmd.iter().map(|a| a.len() + 1).sum::<usize>() + 2;
+        if !call.is_empty() && size + n > CALL_BYTES {
+            tmux.run(&call)?;
+            call.clear();
+            size = 0;
+        }
+        if !call.is_empty() {
+            call.push(";".into());
+        }
+        size += n;
+        call.extend(cmd);
+    }
+    if !call.is_empty() {
+        tmux.run(&call)?;
+    }
     Ok(())
 }
 
