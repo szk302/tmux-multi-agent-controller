@@ -836,6 +836,90 @@ fn the_variables_of_the_agent_that_made_the_session_stay_its_own() {
 }
 
 #[test]
+fn the_first_spawn_keeps_what_tmux_copies_into_its_session() {
+    // The server started with an old value of a variable that tmux copies
+    // from the client into new sessions (update-environment, like
+    // SSH_AUTH_SOCK); the terminal has a new one.
+    let env = Env::new();
+    let started = std::process::Command::new("tmux")
+        .args([
+            "-L",
+            &env.socket,
+            "new-session",
+            "-d",
+            "-s",
+            "other",
+            "sleep 600",
+        ])
+        .env("CLAUDE_TEST_SOCK", "old")
+        .env("CLAUDE_CONFIG_DIR", env.claude_dir())
+        .env("CODEX_HOME", env.codex_dir())
+        .env_remove("TMUX")
+        .status()
+        .unwrap();
+    assert!(started.success());
+    env.tmux(&["set-option", "-g", "update-environment", "CLAUDE_TEST_SOCK"]);
+    let fake = common::fake_as(&env, "claude");
+    let (bin, log) = env.logging_tmux();
+    let secret = "s3cret-passed-to-the-agent";
+    for (name, extra) in [
+        (
+            "p1",
+            &[
+                "--pass-env",
+                "CLAUDE_TEST_SOCK",
+                "--pass-env",
+                "CLAUDE_TEST_SECRET",
+            ][..],
+        ),
+        ("p2", &[][..]),
+    ] {
+        let flog = format!("FAKE_LOG={}", env.log_path(name).display());
+        let mut args = vec!["spawn", name, "-e", &flog];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--", fake.to_str().unwrap()]);
+        let out = env
+            .cmd(&args)
+            .env("PATH", env.path_with(&bin))
+            .env("CLAUDE_TEST_SOCK", "new")
+            .env("CLAUDE_TEST_SECRET", secret)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{name}: {out:?}");
+    }
+    let start = |name: &str| {
+        env.events(name)
+            .into_iter()
+            .find(|e| e["event"] == "start")
+            .unwrap()
+    };
+    // Both agents get the new value, as a shell in the session would.
+    assert_eq!(start("p1")["env"]["CLAUDE_TEST_SOCK"], "new");
+    assert_eq!(
+        start("p2")["env"]["CLAUDE_TEST_SOCK"],
+        "new",
+        "{}",
+        start("p2")
+    );
+    assert_eq!(start("p1")["env"]["CLAUDE_TEST_SECRET"], secret);
+    assert!(start("p2")["env"].get("CLAUDE_TEST_SECRET").is_none());
+    // The session has only the agents' windows, and no value went through
+    // tmux's arguments.
+    let windows = env.tmux(&[
+        "list-windows",
+        "-t",
+        &format!("={PROJECT}"),
+        "-F",
+        "#{window_name}",
+    ]);
+    assert_eq!(String::from_utf8_lossy(&windows.stdout), "p1\np2\n");
+    let argv = std::fs::read_to_string(&log).unwrap();
+    assert!(!argv.contains(secret), "{argv}");
+    env.ok(&["kill", "p1"]);
+    env.ok(&["kill", "p2"]);
+}
+
+#[test]
 fn a_kill_during_spawn_leaves_no_pane() {
     let env = Env::new();
     // A tmux that is slow to make windows, so that the kill comes after
@@ -851,7 +935,7 @@ fn a_kill_during_spawn_leaves_no_pane() {
     std::fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in new-window|new-session) sleep 2; break;; esac; done\nexec '{real}' \"$@\"\n"
+            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in source-file) sleep 2; break;; esac; done\nexec '{real}' \"$@\"\n"
         ),
     )
     .unwrap();

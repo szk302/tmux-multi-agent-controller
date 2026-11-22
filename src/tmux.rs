@@ -31,16 +31,6 @@ fn no_server(stderr: &str) -> bool {
         || stderr.contains("No such file or directory")
 }
 
-/// Escape an argument for tmux's argument list, where an unescaped trailing
-/// `;` separates commands.
-pub fn escape_arg(s: &str) -> String {
-    if s.ends_with(';') && !s.ends_with("\\;") {
-        format!("{}\\;", &s[..s.len() - 1])
-    } else {
-        s.to_string()
-    }
-}
-
 /// Quote a value for a tmux command string (used inside `if-shell`).
 fn tq(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -451,10 +441,6 @@ mod tests {
 
     #[test]
     fn escaping() {
-        assert_eq!(escape_arg("a;"), "a\\;");
-        assert_eq!(escape_arg(";"), "\\;");
-        assert_eq!(escape_arg("a\\;"), "a\\;");
-        assert_eq!(escape_arg("a;b"), "a;b");
         assert_eq!(tq("it's"), "'it'\\''s'");
     }
 }
