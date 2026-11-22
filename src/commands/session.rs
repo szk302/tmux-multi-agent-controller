@@ -5,11 +5,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::config;
-use crate::error::{Error, Result, warn};
+use crate::error::{Error, Result};
 use crate::home::Home;
 use crate::project::{self, AgentRef};
 use crate::record::Agent;
-use crate::tmux::{Tmux, escape_arg};
+use crate::tmux::{Tmux, script_line};
 
 /// Variables `session --create` does not give the session: tmux's own, and
 /// the ones that name an agent (set when it runs in an agent's pane).
@@ -20,10 +20,6 @@ const NOT_COPIED: &[&str] = &[
     "TMAC_AGENT",
     "TMAC_INSTANCE",
 ];
-
-/// Bytes of arguments in one tmux call: tmux refuses a command of about
-/// 16 KB ("command too long", tmux 3.7c).
-const CALL_BYTES: usize = 12 * 1024;
 
 /// Print the project of a directory (§3.1). With `dir`, the project comes
 /// from that directory only (rule 3), not from -p or TMAC_PROJECT.
@@ -65,22 +61,22 @@ pub fn session(explicit: Option<&str>, create: bool) -> Result<()> {
 /// Create the session with this process's environment (§5.8). A server
 /// that already runs gives a new session its own environment (only the
 /// variables of `update-environment` come from the client), so the
-/// differences are set on the session: with `-e` (the first window gets
-/// them, too) as far as one tmux call takes them, then with
-/// `set-environment`, and `set-environment -r` for the variables this
-/// process does not have.
+/// differences are set on the session (`set-environment`, and `-r` for the
+/// variables this process does not have), and the first window's shell is
+/// started again with them. All of it is one line given on standard input:
+/// the values are not in any process's arguments, and other clients see
+/// the session only once it is ready.
 fn create_session(tmux: &Tmux, name: &str, cwd: &Path) -> Result<()> {
     let target = format!("={name}");
-    let mut first: Vec<String> = vec![
+    let cwd = cwd.to_string_lossy().into_owned();
+    let mut commands: Vec<Vec<String>> = vec![vec![
         "new-session".into(),
         "-d".into(),
         "-s".into(),
         name.to_string(),
         "-c".into(),
-        escape_arg(&cwd.to_string_lossy()),
-    ];
-    let mut size: usize = first.iter().map(|a| a.len() + 1).sum();
-    let mut later: Vec<Vec<String>> = Vec::new();
+        cwd.clone(),
+    ]];
     // No server: the new one starts with this process's environment.
     if let Some(server) = tmux.environment(None)? {
         let own: BTreeMap<String, String> = std::env::vars_os()
@@ -88,33 +84,19 @@ fn create_session(tmux: &Tmux, name: &str, cwd: &Path) -> Result<()> {
             .filter(|(k, _)| !NOT_COPIED.contains(&k.as_str()))
             .collect();
         for (k, v) in &own {
-            if server.get(k) == Some(v) {
-                continue;
-            }
-            let pair = escape_arg(&format!("{k}={v}"));
-            if pair.len() + 64 > CALL_BYTES {
-                warn(format!(
-                    "{k} is too long for tmux ({} bytes); the session does not get it",
-                    pair.len()
-                ));
-                continue;
-            }
-            if later.is_empty() && size + pair.len() + 4 <= CALL_BYTES {
-                size += pair.len() + 4;
-                first.extend(["-e".into(), pair]);
-            } else {
-                later.push(vec![
+            if server.get(k) != Some(v) {
+                commands.push(vec![
                     "set-environment".into(),
                     "-t".into(),
                     target.clone(),
                     k.clone(),
-                    escape_arg(v),
+                    v.clone(),
                 ]);
             }
         }
         for k in server.keys() {
             if !own.contains_key(k) && !NOT_COPIED.contains(&k.as_str()) {
-                later.push(vec![
+                commands.push(vec![
                     "set-environment".into(),
                     "-t".into(),
                     target.clone(),
@@ -123,32 +105,24 @@ fn create_session(tmux: &Tmux, name: &str, cwd: &Path) -> Result<()> {
                 ]);
             }
         }
-    }
-    match tmux.run(&first) {
-        Ok(_) => {}
-        // Made by someone else in between: leave its environment alone.
-        Err(e) if e.to_string().contains("duplicate session") => return Ok(()),
-        Err(e) => return Err(e),
-    }
-    let mut call: Vec<String> = Vec::new();
-    let mut size = 0;
-    for cmd in later {
-        let n: usize = cmd.iter().map(|a| a.len() + 1).sum::<usize>() + 2;
-        if !call.is_empty() && size + n > CALL_BYTES {
-            tmux.run(&call)?;
-            call.clear();
-            size = 0;
+        if commands.len() > 1 {
+            // The shell just started with the server's environment.
+            commands.push(vec![
+                "respawn-pane".into(),
+                "-k".into(),
+                "-c".into(),
+                cwd,
+                "-t".into(),
+                format!("{target}:"),
+            ]);
         }
-        if !call.is_empty() {
-            call.push(";".into());
-        }
-        size += n;
-        call.extend(cmd);
     }
-    if !call.is_empty() {
-        tmux.run(&call)?;
+    match tmux.run_script(&script_line(&commands)) {
+        Ok(_) => Ok(()),
+        // Made by someone else in between: the rest of the line was skipped.
+        Err(e) if e.to_string().contains("duplicate session") => Ok(()),
+        Err(e) => Err(e),
     }
-    Ok(())
 }
 
 /// Show the agent's window in this terminal (§10.1): select it, then

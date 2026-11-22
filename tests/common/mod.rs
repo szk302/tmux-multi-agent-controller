@@ -327,6 +327,44 @@ impl Env {
         repo
     }
 
+    /// A directory with a `tmux` that records its arguments (one line per
+    /// call) in the returned log, then runs the real tmux.
+    pub fn logging_tmux(&self) -> (PathBuf, PathBuf) {
+        let real = Command::new("sh")
+            .args(["-c", "command -v tmux"])
+            .output()
+            .unwrap();
+        let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+        let bin = self.tmp.path().join("logging-bin");
+        let log = self.tmp.path().join("tmux-argv.log");
+        std::fs::create_dir_all(&bin).unwrap();
+        let wrapper = bin.join("tmux");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{real}' \"$@\"\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &wrapper,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        (bin, log)
+    }
+
+    /// PATH with `first` before the directory of tmac and the test's PATH.
+    pub fn path_with(&self, first: &Path) -> String {
+        format!(
+            "{}:{}:{}",
+            first.display(),
+            tmac_dir().display(),
+            std::env::var("PATH").unwrap_or_default()
+        )
+    }
+
     /// Wait until `f` holds (up to 20 s).
     pub fn until(&self, what: &str, f: impl Fn() -> bool) {
         let end = Instant::now() + Duration::from_secs(20);
