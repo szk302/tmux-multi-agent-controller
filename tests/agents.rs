@@ -423,6 +423,21 @@ fn usage_errors() {
     env.expect(&["send", "nobody", "a\x1bb"], 2);
     env.expect(&["status", "nobody"], 4);
     env.expect(&["wait", "nobody", "--state", "sleepy"], 2);
+    // Seconds must be numbers from 0 to 1e9 (a bad one used to panic).
+    for bad in ["-1", "NaN", "inf", "1e10", "soon"] {
+        let t = format!("--timeout={bad}");
+        env.expect(&["wait", "nobody", &t], 2);
+        env.expect(&["send", "nobody", "x", &t], 2);
+        env.expect(&["wake", "nobody", "x", &t], 2);
+        env.expect(&["hold", "nobody", &t], 2);
+        env.expect(&["kill", "nobody", &t], 2);
+        env.expect(&["spawn", "x", &t, "--", "claude"], 2);
+        env.expect(
+            &["spawn", "x", &format!("--human-hold={bad}"), "--", "claude"],
+            2,
+        );
+    }
+    assert!(!env.agent_dir("x").exists());
     // A hook never fails with 2, even on bad arguments.
     env.expect(&["hook"], 1);
     // Without an agent in the environment, a hook does nothing.

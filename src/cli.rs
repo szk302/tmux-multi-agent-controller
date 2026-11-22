@@ -135,7 +135,7 @@ pub struct SpawnCli {
     #[arg(long = "no-create-session")]
     pub no_create_session: bool,
     /// Seconds to hold input after a person typed in the pane (0: never)
-    #[arg(long = "human-hold", value_name = "SEC")]
+    #[arg(long = "human-hold", value_name = "SEC", value_parser = crate::util::parse_seconds)]
     pub human_hold: Option<f64>,
     /// Start even if other hooks handle Stop or UserPromptSubmit
     #[arg(long = "allow-foreign-hooks")]
@@ -152,7 +152,7 @@ pub struct SpawnCli {
     #[arg(long = "no-first-prompt")]
     pub no_first_prompt: bool,
     /// Seconds to wait until the agent is idle
-    #[arg(long, value_name = "SEC")]
+    #[arg(long, value_name = "SEC", value_parser = crate::util::parse_seconds)]
     pub timeout: Option<f64>,
     /// The CLI and its arguments
     #[arg(last = true, required = true, value_name = "COMMAND")]
@@ -178,7 +178,7 @@ pub struct SendCli {
     #[arg(short = 'f', long)]
     pub file: Option<PathBuf>,
     /// Seconds to wait until the agent can take input
-    #[arg(long, value_name = "SEC")]
+    #[arg(long, value_name = "SEC", value_parser = crate::util::parse_seconds)]
     pub timeout: Option<f64>,
     /// Fail with exit code 5 instead of waiting
     #[arg(long = "no-wait")]
@@ -190,7 +190,7 @@ pub struct WakeCli {
     pub name: String,
     /// Text to type if the agent is idle (default: standard input)
     pub text: Option<String>,
-    #[arg(long, value_name = "SEC")]
+    #[arg(long, value_name = "SEC", value_parser = crate::util::parse_seconds)]
     pub timeout: Option<f64>,
 }
 
@@ -200,7 +200,7 @@ pub struct WaitCli {
     /// States to wait for, comma separated (default: idle)
     #[arg(long, value_name = "STATE[,STATE...]")]
     pub state: Vec<String>,
-    #[arg(long, value_name = "SEC")]
+    #[arg(long, value_name = "SEC", value_parser = crate::util::parse_seconds)]
     pub timeout: Option<f64>,
 }
 
@@ -213,7 +213,7 @@ pub struct HoldCli {
     #[arg(long)]
     pub note: Option<String>,
     /// Seconds to wait for input in progress to finish
-    #[arg(long, value_name = "SEC")]
+    #[arg(long, value_name = "SEC", value_parser = crate::util::parse_seconds)]
     pub timeout: Option<f64>,
 }
 
@@ -270,7 +270,7 @@ pub struct ListCli {
 pub struct KillCli {
     pub name: String,
     /// Seconds to wait for the CLI to end
-    #[arg(long, value_name = "SEC")]
+    #[arg(long, value_name = "SEC", value_parser = crate::util::parse_seconds)]
     pub timeout: Option<f64>,
     /// Do not end the CLI gracefully, and ignore holds
     #[arg(long)]

@@ -69,6 +69,30 @@ pub fn parse_stamp(s: &str) -> Option<OffsetDateTime> {
 }
 
 /// Seconds elapsed since a time stamp (0 if it cannot be parsed or is in the future).
+/// The largest number of seconds tmac takes (about 31 years), so that a
+/// time limit always makes a valid `Duration` and deadline.
+pub const MAX_SECONDS: f64 = 1e9;
+
+/// Whether `n` is a number of seconds tmac takes: from 0 to
+/// [`MAX_SECONDS`] (not NaN or infinite).
+pub fn valid_seconds(n: f64) -> bool {
+    (0.0..=MAX_SECONDS).contains(&n)
+}
+
+/// Parse a number of seconds from the command line (`--timeout`,
+/// `--human-hold`).
+pub fn parse_seconds(s: &str) -> std::result::Result<f64, String> {
+    let n: f64 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("{s:?} is not a number"))?;
+    if valid_seconds(n) {
+        Ok(n)
+    } else {
+        Err(format!("must be from 0 to {MAX_SECONDS} seconds"))
+    }
+}
+
 pub fn elapsed_secs(s: &str) -> f64 {
     parse_stamp(s)
         .map(|t| (OffsetDateTime::now_utc() - t).as_seconds_f64().max(0.0))

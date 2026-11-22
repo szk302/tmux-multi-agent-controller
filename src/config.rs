@@ -98,8 +98,11 @@ pub fn load(home: &Home) -> Result<Config> {
 
 fn number(v: &Value, key: &str) -> std::result::Result<f64, String> {
     match v.as_f64() {
-        Some(n) if n >= 0.0 && n.is_finite() => Ok(n),
-        _ => Err(format!("{key} must be a non-negative number")),
+        Some(n) if crate::util::valid_seconds(n) => Ok(n),
+        _ => Err(format!(
+            "{key} must be a number of seconds from 0 to {}",
+            crate::util::MAX_SECONDS
+        )),
     }
 }
 
@@ -248,6 +251,15 @@ mod tests {
         assert_eq!(c.relay["claude"]["Stop"], "lmm hook");
         assert_eq!(c.send_settle_sec, 30.0);
         assert_eq!(c.hold_human_sec, 600.0);
+    }
+
+    #[test]
+    fn seconds_are_checked() {
+        for bad in ["-1", ".nan", ".inf", "1e12", "soon"] {
+            let e = parse(&format!("relay:\n  timeout: {bad}\n")).unwrap_err();
+            assert!(e.contains("relay.timeout"), "{bad}: {e}");
+        }
+        assert_eq!(parse("kill:\n  timeout: 0\n").unwrap().kill_timeout, 0.0);
     }
 
     #[test]
