@@ -12,7 +12,7 @@ use crate::hookconf::{self, Check, Lookup};
 use crate::ops;
 use crate::project::{self, AgentRef};
 use crate::record::{self, Agent, AgentFile, State, TmuxInfo};
-use crate::tmux::{Tmux, escape_arg};
+use crate::tmux::{Tmux, script_line};
 use crate::util;
 
 pub struct SpawnArgs {
@@ -377,8 +377,9 @@ fn check_hooks(
     Ok(())
 }
 
-/// Create the window, tag the pane and name the window in one tmux call
-/// (§5.3). Returns the pane id and the server's socket path.
+/// Create the window, tag the pane and name the window in one tmux call,
+/// given on standard input so that the variables are not in any process's
+/// arguments (§5.3). Returns the pane id and the server's socket path.
 fn create_pane(
     tmux: &Tmux,
     info: &AgentFile,
@@ -389,7 +390,12 @@ fn create_pane(
 ) -> Result<(String, String)> {
     let session = &info.tmux.session;
     let instance = &info.instance;
+    let cwd = cwd.to_string_lossy().into_owned();
     let target = format!("={session}:={instance}");
+    // A window that holds a new session until the agent's window is in it.
+    // `new-session -e` would put the agent's variables in the session's
+    // environment, which later windows inherit (§5.4).
+    let holder = format!("tmac-{instance}-new");
     let mut last_err = None;
     for _ in 0..3 {
         let exists = tmux.has_session(session)?;
@@ -398,34 +404,45 @@ fn create_pane(
                 "the tmux session {session:?} is gone"
             )));
         }
-        let mut args: Vec<String> = if exists {
-            vec![
-                "new-window".into(),
-                "-d".into(),
-                "-t".into(),
-                format!("={session}:"),
-            ]
-        } else {
-            vec![
-                "new-session".into(),
-                "-d".into(),
-                "-s".into(),
-                session.clone(),
-            ]
-        };
-        args.extend([
-            "-n".into(),
-            instance.clone(),
-            "-c".into(),
-            escape_arg(&cwd.to_string_lossy()),
-        ]);
-        for (k, v) in env {
-            args.push("-e".into());
-            args.push(escape_arg(&format!("{k}={v}")));
+        let mut commands: Vec<Vec<String>> = Vec::new();
+        if !exists {
+            commands.push(
+                [
+                    "new-session",
+                    "-d",
+                    "-s",
+                    session,
+                    "-n",
+                    &holder,
+                    "-c",
+                    &cwd,
+                    "cat",
+                    "-",
+                ]
+                .map(String::from)
+                .to_vec(),
+            );
         }
-        args.extend(["-P".into(), "-F".into(), "#{pane_id} #{socket_path}".into()]);
-        args.extend(command.iter().map(|c| escape_arg(c)));
-        for opt in [
+        let mut window: Vec<String> = [
+            "new-window",
+            "-d",
+            "-t",
+            &format!("={session}:"),
+            "-n",
+            instance,
+            "-c",
+            &cwd,
+        ]
+        .map(String::from)
+        .to_vec();
+        for (k, v) in env {
+            window.push("-e".into());
+            window.push(format!("{k}={v}"));
+        }
+        window.extend(["-P".into(), "-F".into(), "#{pane_id} #{socket_path}".into()]);
+        window.extend(command.iter().cloned());
+        commands.push(window);
+        for c in [
             vec![
                 "set-option",
                 "-p",
@@ -438,25 +455,23 @@ fn create_pane(
             vec!["set-option", "-p", "-t", &target, "remain-on-exit", "on"],
             vec!["rename-window", "-t", &target, &info.name],
         ] {
-            args.push(";".into());
-            args.extend(opt.into_iter().map(String::from));
+            commands.push(c.into_iter().map(String::from).collect());
         }
         if !exists {
-            // `new-session -e` puts the variables in the session's
-            // environment, which later windows inherit: keep them for this
-            // agent's process only (§5.4). The pane has already started.
-            for (k, _) in env {
-                args.extend([
-                    ";".into(),
-                    "set-environment".into(),
-                    "-t".into(),
-                    format!("={session}"),
-                    "-u".into(),
-                    escape_arg(k),
-                ]);
-            }
+            commands.push(
+                ["kill-window", "-t", &format!("={session}:={holder}")]
+                    .map(String::from)
+                    .to_vec(),
+            );
+            // Number the windows from base-index again, so that the next
+            // window goes after the agent's.
+            commands.push(
+                ["move-window", "-r", "-t", &format!("={session}:")]
+                    .map(String::from)
+                    .to_vec(),
+            );
         }
-        match tmux.run(&args) {
+        match tmux.run_script(&script_line(&commands)) {
             Ok(out) => {
                 let line = out.lines().next().unwrap_or("").trim();
                 let (pane, socket) = line.split_once(' ').unwrap_or((line, ""));
@@ -467,7 +482,19 @@ fn create_pane(
             }
             // Another spawn created the session in between: use new-window.
             Err(e) if e.to_string().contains("duplicate session") => last_err = Some(e),
-            Err(e) => return Err(e),
+            Err(e) => {
+                if !exists {
+                    // The line stopped after making the session: close the
+                    // holder (and with it the session, if nothing else is in
+                    // it).
+                    let _ = tmux.run(&[
+                        "kill-window".into(),
+                        "-t".into(),
+                        format!("={session}:={holder}"),
+                    ]);
+                }
+                return Err(e);
+            }
         }
     }
     Err(last_err.unwrap_or_else(|| Error::runtime("cannot create the tmux window")))

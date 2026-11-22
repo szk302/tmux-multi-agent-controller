@@ -153,23 +153,32 @@ fn sessions_get_the_terminals_environment_on_a_running_server() {
         .status()
         .unwrap();
     assert!(started.success());
+    // The shell of a new session's first window writes its environment.
+    let dump = env.tmp.path().join("first-shell.env");
+    let shell = env.tmp.path().join("dump-shell");
+    std::fs::write(
+        &shell,
+        format!("#!/bin/sh\nenv > '{}'\nexec sleep 600\n", dump.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shell, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    env.tmux(&["set-option", "-g", "default-shell", shell.to_str().unwrap()]);
     // The terminal: tmac's hooks in its CLAUDE_CONFIG_DIR, no
-    // CLAUDE_TEST_GONE, inside an agent's pane (TMAC_AGENT), and variables
-    // too long for one tmux call together or at all.
-    let big = "x".repeat(9000);
+    // CLAUDE_TEST_GONE, inside an agent's pane (TMAC_AGENT), a secret, and
+    // a variable longer than a tmux command line takes.
+    let secret = "s3cret-value-of-the-test";
+    let huge = "y".repeat(20000);
+    let (bin, log) = env.logging_tmux();
     let out = env
         .cmd(&["session", "--create"])
+        .env("PATH", env.path_with(&bin))
         .env("TMAC_AGENT", "outer")
-        .env("CLAUDE_TEST_BIG1", &big)
-        .env("CLAUDE_TEST_BIG2", &big)
-        .env("CLAUDE_TEST_HUGE", "y".repeat(20000))
+        .env("CLAUDE_TEST_SECRET", secret)
+        .env("CLAUDE_TEST_HUGE", &huge)
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("CLAUDE_TEST_HUGE is too long"),
-        "{out:?}"
-    );
+    assert!(out.stderr.is_empty(), "{out:?}");
     let shown = env.tmux(&[
         "show-environment",
         "-t",
@@ -177,6 +186,20 @@ fn sessions_get_the_terminals_environment_on_a_running_server() {
         "TMAC_AGENT",
     ]);
     assert!(!shown.status.success(), "{shown:?}");
+    // The first window's shell was started again with the same environment.
+    env.until("the first shell to start again", || {
+        std::fs::read_to_string(&dump).is_ok_and(|d| d.contains("CLAUDE_TEST_SECRET="))
+    });
+    let first = std::fs::read_to_string(&dump).unwrap();
+    assert!(
+        first.contains(&format!(
+            "CLAUDE_CONFIG_DIR={}\n",
+            env.claude_dir().display()
+        )),
+        "{first}"
+    );
+    assert!(!first.contains("CLAUDE_TEST_GONE="), "{first}");
+    assert!(!first.contains("TMAC_AGENT=outer"), "{first}");
     env.spawn("e1", "claude", &["--no-create-session"], &[]);
     let start = env
         .events("e1")
@@ -189,12 +212,51 @@ fn sessions_get_the_terminals_environment_on_a_running_server() {
         "{start}"
     );
     assert!(start["env"].get("CLAUDE_TEST_GONE").is_none(), "{start}");
-    assert!(start["env"].get("CLAUDE_TEST_HUGE").is_none());
-    for k in ["CLAUDE_TEST_BIG1", "CLAUDE_TEST_BIG2"] {
-        assert_eq!(start["env"][k].as_str(), Some(big.as_str()), "{k}");
-    }
+    assert_eq!(
+        start["env"]["CLAUDE_TEST_HUGE"].as_str(),
+        Some(huge.as_str())
+    );
+    assert_eq!(start["env"]["CLAUDE_TEST_SECRET"], secret);
     assert_eq!(start["env"]["TMAC_AGENT"], "e1");
+    // No value went through tmux's arguments.
+    let argv = std::fs::read_to_string(&log).unwrap();
+    assert!(argv.contains("source-file"), "{argv}");
+    assert!(!argv.contains(secret), "{argv}");
+    assert!(!argv.contains("yyyyyyyyyy"));
     env.ok(&["kill", "e1"]);
+}
+
+#[test]
+fn a_new_server_does_not_get_the_name_of_an_agent() {
+    // session --create run inside an agent's pane (its TMAC_* variables),
+    // for another project, while no server runs.
+    let env = Env::new();
+    let dump = env.tmp.path().join("first-shell.env");
+    let shell = env.tmp.path().join("dump-shell");
+    std::fs::write(
+        &shell,
+        format!("#!/bin/sh\nenv > '{}'\nexec sleep 600\n", dump.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shell, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let out = env
+        .cmd(&["-p", "other", "session", "--create"])
+        .env("TMAC_PROJECT", "parent")
+        .env("TMAC_AGENT", "coder")
+        .env("TMAC_INSTANCE", "11111111-2222-4333-8444-555555555555")
+        .env("SHELL", &shell)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "other\n");
+    for k in ["TMAC_PROJECT", "TMAC_AGENT", "TMAC_INSTANCE"] {
+        let shown = env.tmux(&["show-environment", "-g", k]);
+        assert!(!shown.status.success(), "{k}: {shown:?}");
+    }
+    env.until("the first shell", || dump.exists());
+    let first = std::fs::read_to_string(&dump).unwrap();
+    assert!(!first.contains("TMAC_AGENT="), "{first}");
+    assert!(!first.contains("TMAC_PROJECT="), "{first}");
 }
 
 #[test]
@@ -237,6 +299,11 @@ fn attach_shows_the_agents_window() {
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     assert!(String::from_utf8_lossy(&out.stderr).contains("inside another tmux server"));
     assert_eq!(current(), "shell");
+    // Without a terminal (standard input is /dev/null here), too.
+    let out = env.tmac(&["attach", "a1"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(current(), "shell");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("needs a terminal"));
     env.expect(&["attach", "nobody"], 4);
     env.ok(&["kill", "a1"]);
 }

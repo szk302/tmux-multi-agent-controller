@@ -31,19 +31,32 @@ fn no_server(stderr: &str) -> bool {
         || stderr.contains("No such file or directory")
 }
 
-/// Escape an argument for tmux's argument list, where an unescaped trailing
-/// `;` separates commands.
-pub fn escape_arg(s: &str) -> String {
-    if s.ends_with(';') && !s.ends_with("\\;") {
-        format!("{}\\;", &s[..s.len() - 1])
-    } else {
-        s.to_string()
-    }
-}
-
 /// Quote a value for a tmux command string (used inside `if-shell`).
 fn tq(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Quote a word for a tmux command file: single quotes keep everything
+/// as it is (`$`, `~`, `#{}`, `;`, newlines); a quote is closed, given in
+/// double quotes and reopened.
+fn script_word(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+/// One line of a tmux command file: the commands separated by ` ; `. tmux
+/// runs a line as one group: if a command fails, the rest of the line is
+/// skipped (tmux 3.7c).
+pub fn script_line(commands: &[Vec<String>]) -> String {
+    commands
+        .iter()
+        .map(|c| {
+            c.iter()
+                .map(|w| script_word(w))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join(" ; ")
 }
 
 impl Tmux {
@@ -69,6 +82,12 @@ impl Tmux {
     fn command(&self, args: &[String]) -> Command {
         let mut c = Command::new("tmux");
         c.args(&self.base).args(args);
+        // A server that this client starts takes its environment as the
+        // global one: keep out the variables that name an agent, set when
+        // tmac runs inside an agent's pane (§5.4, §5.8).
+        for k in ["TMAC_PROJECT", "TMAC_AGENT", "TMAC_INSTANCE"] {
+            c.env_remove(k);
+        }
         c
     }
 
@@ -85,6 +104,39 @@ impl Tmux {
                 "tmux {} failed: {}",
                 args.first().map(String::as_str).unwrap_or(""),
                 err.trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Run tmux commands given on standard input (`start-server ;
+    /// source-file -`): the values in them do not appear in the arguments
+    /// of a process, which other users may see (§5.3, §5.8), and their size
+    /// is not limited like a command line (about 16 KB). Starts the server
+    /// if none runs. Returns stdout.
+    pub fn run_script(&self, line: &str) -> Result<String> {
+        let mut child = self
+            .command(&[
+                "start-server".into(),
+                ";".into(),
+                "source-file".into(),
+                "-".into(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| Error::runtime(format!("cannot run tmux: {e}")))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let mut text = line.as_bytes().to_vec();
+            text.push(b'\n');
+            stdin.write_all(&text)?;
+        }
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            return Err(Error::runtime(format!(
+                "tmux failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
             )));
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
@@ -381,11 +433,20 @@ mod tests {
     }
 
     #[test]
+    fn script_words() {
+        assert_eq!(script_word("a b"), "'a b'");
+        assert_eq!(script_word("it's"), "'it'\"'\"'s'");
+        assert_eq!(
+            script_line(&[
+                vec!["new-session".into(), "-d".into()],
+                vec!["set-environment".into(), "A".into(), "$x;".into()],
+            ]),
+            "'new-session' '-d' ; 'set-environment' 'A' '$x;'"
+        );
+    }
+
+    #[test]
     fn escaping() {
-        assert_eq!(escape_arg("a;"), "a\\;");
-        assert_eq!(escape_arg(";"), "\\;");
-        assert_eq!(escape_arg("a\\;"), "a\\;");
-        assert_eq!(escape_arg("a;b"), "a;b");
         assert_eq!(tq("it's"), "'it'\\''s'");
     }
 }
