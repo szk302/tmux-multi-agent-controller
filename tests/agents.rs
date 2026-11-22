@@ -372,6 +372,35 @@ fn foreign_hooks_are_refused() {
 }
 
 #[test]
+fn hooks_without_a_command_are_refused_too() {
+    // Claude Code runs prompt, agent, http and mcp_tool hooks on Stop and
+    // UserPromptSubmit as well, and they can block.
+    let env = Env::new();
+    std::fs::create_dir_all(env.work.join(".claude")).unwrap();
+    std::fs::write(
+        env.work.join(".claude/settings.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"prompt","prompt":"Do the tests pass?"}]}]}}"#,
+    )
+    .unwrap();
+    let fake = common::fake_as(&env, "claude");
+    let out = env.tmac(&["spawn", "p1", "--", fake.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(".claude/settings.json: hooks.Stop (prompt)"),
+        "{out:?}"
+    );
+    assert!(!env.agent_dir("p1").exists());
+    let out = env.tmac(&["doctor", "claude"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("hooks.Stop (prompt)"),
+        "{out:?}"
+    );
+    env.spawn("p1", "claude", &["--allow-foreign-hooks"], &[]);
+    env.ok(&["kill", "p1"]);
+}
+
+#[test]
 fn usage_errors() {
     let env = Env::new();
     env.expect(&["spawn", "Bad", "--", "claude"], 2);
