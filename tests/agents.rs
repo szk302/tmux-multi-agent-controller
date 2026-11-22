@@ -806,6 +806,59 @@ fn the_variables_of_the_agent_that_made_the_session_stay_its_own() {
 }
 
 #[test]
+fn a_kill_during_spawn_leaves_no_pane() {
+    let env = Env::new();
+    // A tmux that is slow to make windows, so that the kill comes after
+    // spawn made the record and before it made the pane.
+    let real = std::process::Command::new("sh")
+        .args(["-c", "command -v tmux"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    let slow = env.tmp.path().join("slow-bin");
+    std::fs::create_dir_all(&slow).unwrap();
+    let wrapper = slow.join("tmux");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in new-window|new-session) sleep 2; break;; esac; done\nexec '{real}' \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &wrapper,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    // The session (and the server) stays after the agent's pane goes.
+    env.ok(&["session", "--create"]);
+    let fake = common::fake_as(&env, "claude");
+    let path = format!(
+        "{}:{}:{}",
+        slow.display(),
+        common::tmac_dir().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let spawn = env
+        .cmd(&["spawn", "k1", "--", fake.to_str().unwrap()])
+        .env("PATH", path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    env.until("the record of k1", || env.agent_dir("k1").exists());
+    // kill waits for spawn to put the pane in the record, then ends it.
+    env.ok(&["kill", "k1", "--force"]);
+    let out = spawn.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(4), "{out:?}");
+    env.expect(&["status", "k1"], 4);
+    let panes = env.tmux(&["list-panes", "-a", "-F", "#{window_name} #{@tmac_agent}"]);
+    assert!(panes.status.success(), "{panes:?}");
+    let panes = String::from_utf8_lossy(&panes.stdout);
+    assert!(!panes.contains("k1"), "{panes}");
+}
+
+#[test]
 fn relays_get_the_working_directory_and_whether_the_stop_continues() {
     let env = Env::new();
     let seen = env.tmp.path().join("seen");

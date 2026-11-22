@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::config;
 use crate::driver::Driver;
 use crate::error::{Error, Result};
-use crate::home::Home;
+use crate::home::{Home, LockKind};
 use crate::hookconf::{self, Check, Lookup};
 use crate::ops;
 use crate::project::{self, AgentRef};
@@ -180,6 +180,11 @@ pub fn run(a: SpawnArgs) -> Result<()> {
     }
     pane_command.extend(command.iter().cloned());
 
+    // Hold the input lock from creating the record until the pane is in it
+    // (§4.3, §5.3): kill takes the same lock, so it cannot remove the
+    // record in between and leave a pane that has no record.
+    let sig = util::signal_flag();
+    let input_lock = home.lock(&key, LockKind::Input, None, Some(&sig))?;
     if let Some(old) = Agent::load(&home, &key)? {
         let exited = ops::reconcile(&old)
             .map(|(st, _)| st.state == State::Exited)
@@ -245,12 +250,22 @@ pub fn run(a: SpawnArgs) -> Result<()> {
     };
     agent.info.tmux.pane = Some(pane.clone());
     agent.info.tmux.socket = Some(socket);
-    agent.write_info()?;
+    if let Err(e) = agent.write_info() {
+        // Do not leave a pane that has no record.
+        let _ = Tmux::for_agent(&agent.info.tmux).kill_pane_tagged(&pane, &instance);
+        let _ = record::remove(&agent);
+        return Err(e);
+    }
     ops::refresh_display_now(&agent);
+    drop(input_lock);
 
-    let sig = util::signal_flag();
     let deadline = Instant::now() + Duration::from_secs_f64(timeout);
     loop {
+        if !agent.still_current()? {
+            return Err(Error::NoAgent(format!(
+                "{key} was removed during start-up (tmac kill?)"
+            )));
+        }
         let (st, _) = ops::reconcile(&agent)?;
         match st.state {
             State::Idle => {
