@@ -236,6 +236,36 @@ fn unconfirmed_input_is_held() {
 }
 
 #[test]
+fn a_slow_relay_does_not_leave_the_input_unconfirmed() {
+    // The UserPromptSubmit relay takes longer than send.confirm_timeout
+    // (3 s here) for the first prompt only.
+    let env = Env::new();
+    env.spawn(
+        "u2",
+        "claude",
+        &[
+            "--relay",
+            "UserPromptSubmit=if grep -q slow; then sleep 5; fi",
+        ],
+        &[],
+    );
+    // send gives up waiting and holds further input as unconfirmed ...
+    env.expect(&["send", "u2", "slow one"], 6);
+    assert_eq!(env.status("u2")["holds"][0], "unconfirmed");
+    // ... until the relay ends: the CLI took the input.
+    env.until("the unconfirmed hold to go", || {
+        env.status("u2")["holds"]
+            .as_sequence()
+            .is_some_and(|h| h.is_empty())
+    });
+    env.ok(&["wait", "u2", "--timeout", "20"]);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    env.ok(&["send", "u2", "--no-wait", "again"]);
+    assert_eq!(env.prompts("u2"), ["slow one", "again"]);
+    env.ok(&["kill", "u2", "--force"]);
+}
+
+#[test]
 fn exited_agents_and_stale_hooks() {
     let env = Env::new();
     env.spawn("e1", "claude", &[], &[]);
