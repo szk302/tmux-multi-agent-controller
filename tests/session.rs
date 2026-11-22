@@ -227,6 +227,39 @@ fn sessions_get_the_terminals_environment_on_a_running_server() {
 }
 
 #[test]
+fn a_new_server_does_not_get_the_name_of_an_agent() {
+    // session --create run inside an agent's pane (its TMAC_* variables),
+    // for another project, while no server runs.
+    let env = Env::new();
+    let dump = env.tmp.path().join("first-shell.env");
+    let shell = env.tmp.path().join("dump-shell");
+    std::fs::write(
+        &shell,
+        format!("#!/bin/sh\nenv > '{}'\nexec sleep 600\n", dump.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shell, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let out = env
+        .cmd(&["-p", "other", "session", "--create"])
+        .env("TMAC_PROJECT", "parent")
+        .env("TMAC_AGENT", "coder")
+        .env("TMAC_INSTANCE", "11111111-2222-4333-8444-555555555555")
+        .env("SHELL", &shell)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "other\n");
+    for k in ["TMAC_PROJECT", "TMAC_AGENT", "TMAC_INSTANCE"] {
+        let shown = env.tmux(&["show-environment", "-g", k]);
+        assert!(!shown.status.success(), "{k}: {shown:?}");
+    }
+    env.until("the first shell", || dump.exists());
+    let first = std::fs::read_to_string(&dump).unwrap();
+    assert!(!first.contains("TMAC_AGENT="), "{first}");
+    assert!(!first.contains("TMAC_PROJECT="), "{first}");
+}
+
+#[test]
 fn attach_shows_the_agents_window() {
     let env = Env::new();
     env.spawn("a1", "claude", &[], &[]);

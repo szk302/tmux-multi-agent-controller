@@ -82,6 +82,12 @@ impl Tmux {
     fn command(&self, args: &[String]) -> Command {
         let mut c = Command::new("tmux");
         c.args(&self.base).args(args);
+        // A server that this client starts takes its environment as the
+        // global one: keep out the variables that name an agent, set when
+        // tmac runs inside an agent's pane (§5.4, §5.8).
+        for k in ["TMAC_PROJECT", "TMAC_AGENT", "TMAC_INSTANCE"] {
+            c.env_remove(k);
+        }
         c
     }
 
