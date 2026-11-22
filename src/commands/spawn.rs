@@ -426,6 +426,21 @@ fn create_pane(
             args.push(";".into());
             args.extend(opt.into_iter().map(String::from));
         }
+        if !exists {
+            // `new-session -e` puts the variables in the session's
+            // environment, which later windows inherit: keep them for this
+            // agent's process only (§5.4). The pane has already started.
+            for (k, _) in env {
+                args.extend([
+                    ";".into(),
+                    "set-environment".into(),
+                    "-t".into(),
+                    format!("={session}"),
+                    "-u".into(),
+                    escape_arg(k),
+                ]);
+            }
+        }
         match tmux.run(&args) {
             Ok(out) => {
                 let line = out.lines().next().unwrap_or("").trim();

@@ -4,7 +4,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::Env;
+use common::{Env, PROJECT};
 
 fn state(env: &Env, name: &str) -> String {
     env.field(name, "state")
@@ -754,6 +754,40 @@ fn session_variables_of_a_parent_cli_are_removed() {
     let agent = std::fs::read_to_string(env.agent_dir("v1").join("agent.yml")).unwrap();
     assert!(!agent.contains("exec-clean"), "{agent}");
     env.ok(&["kill", "v1"]);
+}
+
+#[test]
+fn the_variables_of_the_agent_that_made_the_session_stay_its_own() {
+    // The first spawn makes the session (new-session -e): its variables
+    // must not reach the next agents.
+    let env = Env::new();
+    env.spawn("s1", "claude", &["-e", "CLAUDE_TEST_MAILBOX=first"], &[]);
+    env.spawn("s2", "claude", &[], &[]);
+    let start = |name: &str| {
+        env.events(name)
+            .into_iter()
+            .find(|e| e["event"] == "start")
+            .unwrap()
+    };
+    assert_eq!(start("s1")["env"]["CLAUDE_TEST_MAILBOX"], "first");
+    let second = start("s2");
+    assert!(
+        second["env"].get("CLAUDE_TEST_MAILBOX").is_none(),
+        "{second}"
+    );
+    assert_eq!(second["env"]["TMAC_AGENT"], "s2");
+    let shown = env.tmux(&["show-environment", "-t", &format!("={PROJECT}")]);
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    for k in [
+        "CLAUDE_TEST_MAILBOX",
+        "TMAC_AGENT",
+        "TMAC_INSTANCE",
+        "FAKE_LOG",
+    ] {
+        assert!(!shown.contains(&format!("{k}=")), "{k} in {shown}");
+    }
+    env.ok(&["kill", "s1"]);
+    env.ok(&["kill", "s2"]);
 }
 
 #[test]
