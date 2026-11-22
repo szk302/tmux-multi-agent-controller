@@ -140,6 +140,14 @@ pub fn attach(agent_ref: &AgentRef) -> Result<()> {
     // so that a refused attach changes nothing.
     match std::env::var("TMUX").ok().filter(|v| !v.is_empty()) {
         None => {
+            // tmux attaches standard input, which must be a terminal.
+            // SAFETY: isatty only looks at the descriptor.
+            if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+                return Err(Error::runtime(format!(
+                    "attach needs a terminal, and standard input is not one; run it in a \
+                     terminal, or `tmux -S {socket} attach -t ={session}`"
+                )));
+            }
             tmux.select(&pane.id)?;
             Err(tmux.exec_attach(&session))
         }

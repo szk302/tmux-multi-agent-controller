@@ -299,6 +299,11 @@ fn attach_shows_the_agents_window() {
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     assert!(String::from_utf8_lossy(&out.stderr).contains("inside another tmux server"));
     assert_eq!(current(), "shell");
+    // Without a terminal (standard input is /dev/null here), too.
+    let out = env.tmac(&["attach", "a1"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(current(), "shell");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("needs a terminal"));
     env.expect(&["attach", "nobody"], 4);
     env.ok(&["kill", "a1"]);
 }
